@@ -6,6 +6,8 @@
 
 项目使用 Claude/Deepseek 进行开发，目前处于早期阶段，还存在很多问题，欢迎提交代码或 issue。
 
+此项目是一个分支，仅优化，来自 IceSoulHanxi/easytier-ws-relay
+
 > **注意：本项目仅供学习交流使用**
 
 ## 技术架构
