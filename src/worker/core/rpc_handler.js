@@ -4,6 +4,7 @@ import { getPeerManager } from './peer_manager.js';
 import { wrapPacket, randomU64String, sha256 } from './crypto.js';
 import { gzipMaybe, gunzipMaybe, isCompressionAvailable } from './compress.js';
 import { loadProtos } from './protos.js';
+import { getPeerCenterState, calcPeerCenterDigestFromMap, buildPeerCenterResponseMap } from './global_state.js';
 
 // Helper to convert transactionId to proper format for protobuf int64
 function toLongForProto(value) {
@@ -49,83 +50,8 @@ function toLongForProto(value) {
   return value;
 }
 
-const peerCenterStateByGroup = new Map();
-const PEER_CENTER_TTL_MS = Number(process.env.EASYTIER_PEER_CENTER_TTL_MS || 180_000);
-const PEER_CENTER_CLEAN_INTERVAL = Math.max(30_000, Math.min(PEER_CENTER_TTL_MS / 2, 120_000));
-let lastPeerCenterClean = 0;
 function pm() {
   return getPeerManager();
-}
-
-function getPeerCenterState(groupKey) {
-  const k = String(groupKey || '');
-  let s = peerCenterStateByGroup.get(k);
-  if (!s) {
-    s = {
-      globalPeerMap: new Map(),
-      digest: '0',
-    };
-    peerCenterStateByGroup.set(k, s);
-  }
-  const now = Date.now();
-  if (now - lastPeerCenterClean > PEER_CENTER_CLEAN_INTERVAL) {
-    cleanPeerCenterState(now);
-  }
-  s.lastTouch = Date.now();
-  return s;
-}
-
-function cleanPeerCenterState(now = Date.now()) {
-  lastPeerCenterClean = now;
-  for (const [gk, s] of peerCenterStateByGroup.entries()) {
-    for (const [pid, info] of s.globalPeerMap.entries()) {
-      if (now - (info.lastSeen || 0) > PEER_CENTER_TTL_MS) {
-        s.globalPeerMap.delete(pid);
-      }
-    }
-    if (now - (s.lastTouch || 0) > PEER_CENTER_TTL_MS && s.globalPeerMap.size === 0) {
-      peerCenterStateByGroup.delete(gk);
-    }
-  }
-}
-
-function calcPeerCenterDigestFromMap(mapObj) {
-  const h = sha256();
-  const keys = Object.keys(mapObj).sort();
-  for (const k of keys) {
-    h.update(k);
-    const directPeers = mapObj[k].directPeers || {};
-    const dKeys = Object.keys(directPeers).sort();
-    for (const dk of dKeys) {
-      h.update(dk);
-      const v = directPeers[dk];
-      h.update(Buffer.from(String(v && v.latencyMs !== undefined ? v.latencyMs : 0)));
-    }
-  }
-  const b = h.digest();
-  let x = 0n;
-  for (let i = 0; i < 8; i++) {
-    x = (x << 8n) | BigInt(b[i]);
-  }
-  const u64 = x & 0xFFFFFFFFFFFFFFFFn;
-  return u64.toString();
-}
-
-function buildPeerCenterResponseMap(groupKey, state) {
-  const out = {};
-  const set = new Set(pm().listPeerIdsInGroup(groupKey));
-  const infos = pm()._getPeerInfosMap(groupKey, false);
-  if (infos) {
-    for (const pid of infos.keys()) set.add(pid);
-  }
-  for (const peerId of set) {
-    const key = String(peerId);
-    const existing = state.globalPeerMap.get(key);
-    out[key] = existing ? { ...existing } : { directPeers: {} };
-    if (!out[key].directPeers) out[key].directPeers = {};
-    out[key].directPeers[String(MY_PEER_ID)] = { latencyMs: 0 };
-  }
-  return out;
 }
 
 function sendRpcResponse(ws, toPeerId, reqRpcPacket, types, responseBodyBytes) {
@@ -433,18 +359,62 @@ function handleSyncRouteInfo(ws, fromPeerId, reqRpcPacket, syncReq, types) {
   pm().onRouteSessionAck(groupKey, fromPeerId, syncReq.mySessionId, ws.weAreInitiator);
 
   let hasNewPeers = false;
+  let hasSubPeers = false;
+  
+  // 处理路由信息中的 peer 信息
   if (syncReq.peerInfos && syncReq.peerInfos.items) {
+    console.log(`[SyncRoute] Processing ${syncReq.peerInfos.items.length} peer infos from ${fromPeerId}`);
+    
     syncReq.peerInfos.items.forEach(info => {
       if (info.peerId !== MY_PEER_ID) {
         const infos = pm()._getPeerInfosMap(groupKey, false);
         const isNew = !infos || !infos.has(info.peerId);
+        
+        // 如果客户端提供了有效的 STUN 信息，保留它
+        // 否则使用默认的 P2P 友好的 NAT 类型
+        if (!info.udpStunInfo || info.udpStunInfo === 0) {
+          info.udpStunInfo = 3; // 默认设置为 FullCone NAT，鼓励 P2P 打洞
+        }
+        
         pm().updatePeerInfo(groupKey, info.peerId, info);
         if (isNew) hasNewPeers = true;
+        
+        // 检查是否是子设备（不是直接连接的 peer）
+        const directPeers = pm().listPeerIdsInGroup(groupKey);
+        if (!directPeers.includes(info.peerId)) {
+          hasSubPeers = true;
+          console.log(`[SyncRoute] Discovered sub-peer ${info.peerId} via ${fromPeerId}, NAT type: ${info.udpStunInfo}`);
+        } else {
+          console.log(`[SyncRoute] Updated peer ${info.peerId}, NAT type: ${info.udpStunInfo}`);
+        }
       }
       if (info.peerId === MY_PEER_ID) {
         pm().updatePeerInfo(groupKey, info.peerId, info);
       }
     });
+  }
+
+  // 更新全局 peer 中心状态，记录子设备信息
+  if (hasSubPeers) {
+    const state = getPeerCenterState(groupKey);
+    const directPeers = {};
+    
+    // 记录从当前 peer 发现的子设备
+    if (syncReq.peerInfos && syncReq.peerInfos.items) {
+      syncReq.peerInfos.items.forEach(info => {
+        if (info.peerId !== MY_PEER_ID && info.peerId !== fromPeerId) {
+          directPeers[String(info.peerId)] = { latencyMs: 10 }; // 默认延迟
+        }
+      });
+    }
+    
+    if (Object.keys(directPeers).length > 0) {
+      state.globalPeerMap.set(String(fromPeerId), { 
+        directPeers, 
+        lastSeen: Date.now() 
+      });
+      console.log(`[PeerCenter] Updated global peer map for ${fromPeerId} with ${Object.keys(directPeers).length} sub-peers`);
+    }
   }
 
   const respPayload = {
@@ -474,10 +444,11 @@ function handleSyncRouteInfo(ws, fromPeerId, reqRpcPacket, syncReq, types) {
     console.error(`Failed to push route update to peer ${fromPeerId}:`, e);
   }
 
-  if (hasNewPeers) {
+  // 如果有新的 peer 或子设备，广播路由更新
+  if (hasNewPeers || hasSubPeers) {
     try {
       pm().broadcastRouteUpdate(types, groupKey, fromPeerId, { forceFull: true });
-      console.log(`Successfully broadcast route update for group ${groupKey}`);
+      console.log(`Successfully broadcast route update for group ${groupKey} (newPeers:${hasNewPeers}, subPeers:${hasSubPeers})`);
     } catch (e) {
       console.error(`Failed to broadcast route update for group ${groupKey}:`, e);
     }
