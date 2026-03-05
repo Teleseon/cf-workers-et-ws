@@ -162,8 +162,15 @@ function handleHandshake(ws, header, payload, types) {
       try {
         if (ws.readyState === WS_OPEN) {
           const pm = getPeerManager();
+          
+          // 为新设备推送完整的路由信息
           pm.pushRouteUpdateTo(req.myPeerId, ws, types, { forceFull: true });
-          pm.broadcastRouteUpdate(types, ws.groupKey, req.myPeerId, { forceFull: true });
+          
+          // 为所有现有设备广播路由更新，包括新设备
+          // 确保所有设备都能获得最新的连接位图
+          pm.broadcastRouteUpdate(types, ws.groupKey, null, { forceFull: true });
+          
+          console.log(`[Handshake] Initial route updates completed for peer ${req.myPeerId}`);
         }
       } catch (e) {
         console.error(`Failed to push initial route update to ${req.myPeerId}:`, e.message);
