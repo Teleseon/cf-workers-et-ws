@@ -4,9 +4,9 @@
 
 该项目是 EasyTier 的第三方服务端实现。EasyTier 是一个去中心化 P2P 组网程序，官方代码使用 Rust 实现。本项目使用 Cloudflare Worker + Durable Object 实现了 JavaScript 版本的 WebSocket 服务端，支持网络转发与 P2P 打洞信息交换。
 
-项目使用 Claude/Deepseek 进行开发，目前处于早期阶段，还存在很多问题，欢迎提交代码或 issue。
+项目使用 Claude/Deepseek 进行开发，目前处于早期阶段，还存在很多问题。
 
-此项目是一个分支，仅优化，来自 IceSoulHanxi/easytier-ws-relay
+此项目是一个分支，仅优化，来自 IceSoulHanxi/easytier-ws-relay 大家可以提交issues到主项目。本项目可 pull requests 改进
 
 > **注意：本项目仅供学习交流使用**
 
@@ -177,8 +177,10 @@ wss://your-deployment.workers.dev:0/ws
 ```
 
 ## 贡献
+
 由于基于JS创建项目功能有限。
-欢迎提交 Issue 和 Pull Request 或 Fork 来改进本项目。
+本分支为临时修复，需要在此基础上改进请 Pull Request 改进本项目。
+欢迎提交 Issue 和 Pull Request 到 IceSoulHanxi/easytier-ws-relay 来改进源项目。
 
 ## 许可证
 
