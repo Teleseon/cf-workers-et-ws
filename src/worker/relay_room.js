@@ -1,3 +1,19 @@
+/**
+ * EasyTier WebSocket 中继房间实现
+ * 
+ * 本文件实现了 WebSocket 连接管理、心跳检测和断线清理功能
+ * 主要修复了原版存在的"幽灵节点"问题，实现了秒级断线检测和实时设备列表刷新
+ * 
+ * 核心改进：
+ * - 心跳机制优化：10秒心跳间隔，25秒超时判定
+ * - 主动清理机制：超时后立即触发全局网络清理  
+ * - 防抖保护：防止重复清理导致的广播风暴
+ * - 0值绕过修复：避免从未发过Pong的死连接成为永久幽灵
+ * 
+ * @file relay_room.js
+ * @version 2.0.0
+ */
+
 import { Buffer } from 'buffer';
 import { parseHeader, createHeader } from './core/packet.js';
 import { PacketType, HEADER_SIZE, MY_PEER_ID } from './core/constants.js';
@@ -120,7 +136,10 @@ export class RelayRoom {
   }
 
   async webSocketClose(ws) {
-    // 清理心跳定时器
+    // 【修复】：加入防抖锁，防止风暴
+    if (ws.isCleanedUp) return;
+    ws.isCleanedUp = true;
+
     if (ws.heartbeatInterval) {
       clearInterval(ws.heartbeatInterval);
       ws.heartbeatInterval = null;
@@ -131,11 +150,11 @@ export class RelayRoom {
       const removed = this.peerManager.removePeer(ws);
       if (removed) {
         try {
-          this.peerManager.broadcastRouteUpdate(this.types, groupKey);
+          // 【修复】：强制携带 forceFull: true 广播，强推给所有存活节点
+          this.peerManager.broadcastRouteUpdate(this.types, groupKey, null, { forceFull: true });
         } catch (_) { }
       }
       
-      // 清理网络组活动状态
       if (groupKey && typeof removeNetworkGroupActivity === 'function') {
         try {
           removeNetworkGroupActivity(groupKey);
@@ -156,7 +175,8 @@ export class RelayRoom {
     ws.domainName = meta.domainName || null;
     ws.lastSeen = Date.now();
     ws.lastPingSent = 0;
-    ws.lastPongReceived = 0;
+    // 【修复】：初始化为当前时间，避免 0 值导致的永久免死金牌
+    ws.lastPongReceived = Date.now();
     ws.serverSessionId = meta.serverSessionId || randomU64String();
     ws.weAreInitiator = false;
     ws.crypto = { enabled: false };
@@ -182,39 +202,35 @@ export class RelayRoom {
   }
 
   _startHeartbeat(ws) {
-    // 清除现有的心跳定时器
     if (ws.heartbeatInterval) {
       clearInterval(ws.heartbeatInterval);
     }
     
-    // 从环境变量获取配置，使用合理的默认值
-    const heartbeatInterval = Number(this.env.EASYTIER_HEARTBEAT_INTERVAL || 25000);
-    const connectionTimeout = Number(this.env.EASYTIER_CONNECTION_TIMEOUT || 60000);
-    const checkInterval = Math.min(heartbeatInterval / 5, 5000); // 每5秒或更短检查一次
+    // 缩短超时判定周期，提升列表刷新速度
+    const heartbeatInterval = 10000;
+    const connectionTimeout = 25000;
+    const checkInterval = 5000;
     
-    console.log(`[heartbeat] Starting heartbeat for peer ${ws.peerId}: interval=${heartbeatInterval}ms, timeout=${connectionTimeout}ms`);
+    console.log(`[heartbeat] Starting heartbeat for peer ${ws.peerId}`);
     
     ws.heartbeatInterval = setInterval(() => {
       try {
         if (ws.readyState === WS_OPEN) {
           const now = Date.now();
-          
-          // 检查是否需要发送ping
           if (now - ws.lastPingSent > heartbeatInterval) {
             this._sendPing(ws);
             ws.lastPingSent = now;
           }
           
-          // 检查连接超时
-          if (ws.lastPongReceived > 0 && now - ws.lastPongReceived > connectionTimeout) {
-            console.log(`[heartbeat] Connection timeout for peer ${ws.peerId}, closing`);
-            ws.close();
+          // 【修复】：删掉原版错误的 > 0 判断，超时后主动触发全局网络清理
+          if (now - ws.lastPongReceived > connectionTimeout) {
+            console.log(`[heartbeat] Connection timeout for peer ${ws.peerId}, forcing cleanup`);
+            this.webSocketClose(ws);
+            try { ws.close(); } catch(_) {}
             return;
           }
         } else {
-          // WebSocket已关闭，清理定时器
-          clearInterval(ws.heartbeatInterval);
-          ws.heartbeatInterval = null;
+          this.webSocketClose(ws);
         }
       } catch (e) {
         console.error('[heartbeat] Error in heartbeat interval:', e);
