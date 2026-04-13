@@ -28,7 +28,7 @@ EASYTIER_COMPRESS_RPC = "1"
 LOCATION_HINT = "apac"
 
 # 私有模式：填入与客户端相同的网络名称。留空则允许任何人连接
-EASYTIER_NETWORK_NAME = "pal"
+EASYTIER_NETWORK_NAME = "palo114514"
 
 # 延迟优先模式：设为 "1" 开启，开启后中继发出的包会带上特权标志位，加速路由收敛
 EASYTIER_LATENCY_FIRST = "1"
