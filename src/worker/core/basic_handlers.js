@@ -80,19 +80,27 @@ export function handleHandshake(ws, header, payload, types) {
     const clientNetworkName = req.networkName || '';
 
     // 私有模式拦截
-    const env                = ws._env || {};
-    const privateNetworkName = env.EASYTIER_NETWORK_NAME || '';
+    const env = ws._env || {};
+
+    // 私有模式拦截：优先读 CF env 绑定，回退到 process.env（wrangler dev 场景）
+    // 注意：EasyTier 客户端在 isPublicServer=true 时跳过 networkName 校验，
+    // 因此服务端必须始终以 isPublicServer=true + networkName='public_server' 响应，
+    // 否则客户端会因 identity mismatch 报 SecretKeyError。
+    // 私有模式拦截（提前拒绝不匹配的连接）仍然有效，但握手响应本身保持公开服务器格式。
+    const privateNetworkName =
+      env.EASYTIER_NETWORK_NAME ||
+      (typeof process !== 'undefined' && process.env && process.env.EASYTIER_NETWORK_NAME) ||
+      '';
     if (privateNetworkName && clientNetworkName !== privateNetworkName) {
       console.error(`[Private Mode] Rejected: expected "${privateNetworkName}", got "${clientNetworkName}"`);
       ws.close(1008, 'Network name mismatch');
       return;
     }
 
-    const isPublicServer  = !privateNetworkName;
-    const serverNetworkName =
-      privateNetworkName ||
-      env.EASYTIER_PUBLIC_SERVER_NETWORK_NAME ||
-      'public_server';
+    // 始终以公开服务器身份响应，保持与 EasyTier 客户端的协议兼容性
+    // （客户端在 isPublicServer=true 时不校验 networkName，避免 SecretKeyError）
+    const isPublicServer    = true;
+    const serverNetworkName = 'public_server';
 
     // 密码摘要 → groupKey
     const clientDigest = req.networkSecretDigrest
