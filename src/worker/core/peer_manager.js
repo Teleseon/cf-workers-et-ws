@@ -1,16 +1,13 @@
 /**
  * EasyTier 对等节点管理器
- * 
- * 本文件实现了对等节点管理、路由同步和连接位图生成功能
- * 核心改进：引入基于时间戳的全局单调递增版本号，彻底解决路由版本污染问题
- * 
- * 核心修复：
- * - 全局单调递增版本号：防止Worker重启或P2P交叉污染导致的版本回退
- * - 强制版本同步：所有peer使用统一的全局版本号，确保客户端必须接收新路由
- * - 拓扑签名简化：签名只基于拓扑结构本身，不包含错误的独立版本号
- * 
- * @file peer_manager.js
- * @version 2.0.0
+ *
+ * 负责：peer 注册/注销、路由信息聚合、连接位图生成、路由广播
+ *
+ * 核心设计：
+ * - 全局单调递增版本号（globalNetworkVersion）：防止 Worker 重启或
+ *   P2P 交叉污染导致的版本回退，确保客户端必须接收新路由
+ * - 基于时间戳初始化的版本号：比任何客户端缓存的旧版本都大
+ * - 全连接拓扑 ConnBitmap：鼓励所有 peer 之间尝试 P2P 打洞
  */
 
 import { Buffer } from 'buffer';
@@ -19,10 +16,14 @@ import { createHeader } from './packet.js';
 import { wrapPacket, randomU64String } from './crypto.js';
 import { getPeerCenterState, cleanPeerAndSubPeers } from './global_state.js';
 
-const WS_OPEN = 1; // WebSocket.OPEN in CF runtime
+const WS_OPEN = 1; // Cloudflare Workers 运行时中 WebSocket.OPEN 的值
+
+// ──────────────────────────────────────────────────────────────
+// 纯函数工具
+// ──────────────────────────────────────────────────────────────
 
 function parseIpv4ToU32Be(ip) {
-  const parts = String(ip).trim().split('.').map(x => Number(x));
+  const parts = String(ip).trim().split('.').map(Number);
   if (parts.length !== 4 || parts.some(x => !Number.isInteger(x) || x < 0 || x > 255)) {
     throw new Error(`Invalid IPv4: ${ip}`);
   }
@@ -37,18 +38,15 @@ function mask32FromLen(len) {
 }
 
 function deriveSameNetworkIpv4(peerAddr, networkLength, myPeerId) {
-  const mask = mask32FromLen(networkLength);
-  const net = (peerAddr >>> 0) & mask;
+  const mask     = mask32FromLen(networkLength);
+  const net      = (peerAddr >>> 0) & mask;
   const hostBits = 32 - Number(networkLength);
-  if (!Number.isFinite(hostBits) || hostBits <= 1 || hostBits > 30) {
-    return null;
-  }
-  const hostMax = (1 << hostBits) >>> 0;
+  if (!Number.isFinite(hostBits) || hostBits <= 1 || hostBits > 30) return null;
+
+  const hostMax  = (1 << hostBits) >>> 0;
   const peerHost = (peerAddr >>> 0) & (~mask >>> 0);
   let host = (Number(myPeerId) % 250) + 2;
-  if (host >= hostMax) {
-    host = (Number(myPeerId) % Math.max(hostMax - 2, 1)) + 1;
-  }
+  if (host >= hostMax) host = (Number(myPeerId) % Math.max(hostMax - 2, 1)) + 1;
   if (host === peerHost) {
     host = (host + 1) % hostMax;
     if (host === 0) host = 1;
@@ -56,118 +54,147 @@ function deriveSameNetworkIpv4(peerAddr, networkLength, myPeerId) {
   return (net | host) >>> 0;
 }
 
-// 生成安全的 32位无符号整数
 function randomUint32() {
   return Math.floor(Math.random() * 4294967296);
 }
 
 function makeInstId() {
-  return {
-    part1: randomUint32(),
-    part2: randomUint32(),
-    part3: randomUint32(),
-    part4: randomUint32(),
-  };
+  return { part1: randomUint32(), part2: randomUint32(), part3: randomUint32(), part4: randomUint32() };
 }
 
+/**
+ * 为不在本地 peerInfos 中的已知子设备创建临时 stub 信息
+ * （不保存到 peerInfosByGroup，只用于路由推送）
+ */
 function makeStubPeerInfo(peerId, networkLength) {
   return {
     peerId,
-    version: 1,
-    lastUpdate: { seconds: Math.floor(Date.now() / 1000), nanos: 0 },
-    instId: makeInstId(),
-    cost: 1,
-    hostname: "CF-ETSV",
-    easytierVersion: "cf-et-ws",
-    featureFlag: { isPublicServer: false, avoidRelayData: false, kcpInput: false, noRelayKcp: false },
-    networkLength: Number(networkLength || 24),
-    peerRouteId: randomU64String(),
-    groups: [],
-    udpStunInfo: 1, // 默认设置为 OpenInternet，鼓励 P2P 打洞
+    version:         1,
+    lastUpdate:      { seconds: Math.floor(Date.now() / 1000), nanos: 0 },
+    instId:          makeInstId(),
+    cost:            1,
+    hostname:        'CF-ETSV',
+    easytierVersion: 'cf-et-ws',
+    featureFlag:     { isPublicServer: false, avoidRelayData: false, kcpInput: false, noRelayKcp: false },
+    networkLength:   Number(networkLength || 24),
+    peerRouteId:     randomU64String(),
+    groups:          [],
+    udpStunInfo:     1, // OpenInternet，鼓励 P2P 打洞
   };
 }
 
+// ──────────────────────────────────────────────────────────────
+// PeerManager
+// ──────────────────────────────────────────────────────────────
+
 export class PeerManager {
   constructor() {
-    this.peersByGroup = new Map(); // groupKey -> Map(peerId -> ws)
-    this.peerInfosByGroup = new Map(); // groupKey -> Map(peerId -> peerInfo)
-    this.routeSessions = new Map(); // groupKey -> peerId -> session state
-    this.peerConnVersions = new Map(); // groupKey -> peerId -> version
+    /** groupKey -> Map<peerId, WebSocket> */
+    this.peersByGroup = new Map();
+    /** groupKey -> Map<peerId, RoutePeerInfo> */
+    this.peerInfosByGroup = new Map();
+    /** groupKey -> Map<peerId, session> */
+    this.routeSessions = new Map();
+    /** groupKey -> Map<peerId, version number> */
+    this.peerConnVersions = new Map();
+
     this.types = null;
+    this.myInfo = null; // 懒初始化，避免在全局作用域调用随机函数
 
-    this.allowVirtualIP = false;
-    this.ipConfiguredByEnv = !!process.env.EASYTIER_IPV4_ADDR;
-    this.netConfiguredByEnv = process.env.EASYTIER_NETWORK_LENGTH !== undefined;
-    this.ipAutoAssigned = false;
-    this.myInfo = null; // lazily initialized to avoid random in global scope
-    this.sessionTtlMs = Number(process.env.EASYTIER_SESSION_TTL_MS || 3 * 60 * 1000);
-    this.lastSessionCleanup = 0;
+    this.allowVirtualIP      = false;
+    this.ipConfiguredByEnv   = !!process.env.EASYTIER_IPV4_ADDR;
+    this.netConfiguredByEnv  = process.env.EASYTIER_NETWORK_LENGTH !== undefined;
+    this.ipAutoAssigned      = false;
+    this.pureP2PMode         = process.env.EASYTIER_DISABLE_RELAY === '1';
+    this.sessionTtlMs        = Number(process.env.EASYTIER_SESSION_TTL_MS || 3 * 60 * 1000);
+    this.lastSessionCleanup  = 0;
 
-    this.pureP2PMode = (process.env.EASYTIER_DISABLE_RELAY === '1');
+    // 全局单调递增版本号，初始化为当前秒数截断（确保大于任何旧缓存版本）
+    this.globalNetworkVersion = Math.floor(Date.now() / 1000) % 2_000_000_000;
   }
 
   setTypes(types) {
     this.types = types;
   }
 
+  // ── myInfo 管理 ──
+
   ensureMyInfo() {
     if (this.myInfo) return this.myInfo;
-    const myInfo = {
-      peerId: MY_PEER_ID,
-      instId: makeInstId(),
-      cost: 1,
-      version: 1,
+    const info = {
+      peerId:          MY_PEER_ID,
+      instId:          makeInstId(),
+      cost:            1,
+      version:         1,
       featureFlag: {
         isPublicServer: true,
         avoidRelayData: this.pureP2PMode,
-        kcpInput: false,
-        noRelayKcp: false
+        kcpInput:       false,
+        noRelayKcp:     false,
       },
-      networkLength: Number(process.env.EASYTIER_NETWORK_LENGTH || 24),
-      easytierVersion: process.env.EASYTIER_VERSION || "cf-et-ws",
-      lastUpdate: { seconds: Math.floor(Date.now() / 1000), nanos: 0 },
-      hostname: process.env.EASYTIER_HOSTNAME || "CF-ETSV",
-      udpStunInfo: 1, // 服务器设置为 OpenInternet，支持 P2P 打洞
-      peerRouteId: randomU64String(),
-      groups: [],
+      networkLength:    Number(process.env.EASYTIER_NETWORK_LENGTH || 24),
+      easytierVersion:  process.env.EASYTIER_VERSION || 'cf-et-ws',
+      lastUpdate:       { seconds: Math.floor(Date.now() / 1000), nanos: 0 },
+      hostname:         process.env.EASYTIER_HOSTNAME || 'CF-ETSV',
+      udpStunInfo:      1, // OpenInternet
+      peerRouteId:      randomU64String(),
+      groups:           [],
     };
 
     if (this.allowVirtualIP) {
       const ipEnv = process.env.EASYTIER_IPV4_ADDR;
       if (ipEnv) {
-        myInfo.ipv4Addr = { addr: parseIpv4ToU32Be(ipEnv) };
+        info.ipv4Addr      = { addr: parseIpv4ToU32Be(ipEnv) };
         this.ipAutoAssigned = false;
       } else if (process.env.EASYTIER_AUTO_IPV4_ADDR === '1') {
-        const lastOctet = (Number(MY_PEER_ID) % 250) + 2;
-        myInfo.ipv4Addr = { addr: parseIpv4ToU32Be(`10.0.0.${lastOctet}`) };
+        const octet  = (Number(MY_PEER_ID) % 250) + 2;
+        info.ipv4Addr = { addr: parseIpv4ToU32Be(`10.0.0.${octet}`) };
         this.ipAutoAssigned = true;
       }
     }
 
-    this.myInfo = myInfo;
-    return this.myInfo;
+    this.myInfo = info;
+    return info;
   }
 
   bumpMyInfoVersion() {
-    const myInfo = this.ensureMyInfo();
-    myInfo.version = (myInfo.version || 0) + 1;
-    myInfo.lastUpdate = { seconds: Math.floor(Date.now() / 1000), nanos: 0 };
+    const info  = this.ensureMyInfo();
+    info.version = (info.version || 0) + 1;
+    info.lastUpdate = { seconds: Math.floor(Date.now() / 1000), nanos: 0 };
   }
+
+  setPublicServerFlag(isPublicServer) {
+    const info = this.ensureMyInfo();
+    const next = !!isPublicServer;
+    if (!!(info.featureFlag && info.featureFlag.isPublicServer) !== next) {
+      info.featureFlag = { ...info.featureFlag, isPublicServer: next };
+      this.bumpMyInfoVersion();
+    }
+  }
+
+  setPureP2PMode(enabled) {
+    const next = !!enabled;
+    if (next === this.pureP2PMode) return;
+    this.pureP2PMode = next;
+    const info = this.ensureMyInfo();
+    info.featureFlag = { ...info.featureFlag, avoidRelayData: next };
+    this.bumpMyInfoVersion();
+  }
+
+  isPureP2PMode() { return !!this.pureP2PMode; }
+
+  // ── 版本号管理 ──
 
   _getPeerConnVersionMap(groupKey, create = false) {
     const k = String(groupKey || '');
     let m = this.peerConnVersions.get(k);
-    if (!m && create) {
-      m = new Map();
-      this.peerConnVersions.set(k, m);
-    }
+    if (!m && create) { m = new Map(); this.peerConnVersions.set(k, m); }
     return m;
   }
 
   bumpPeerConnVersion(groupKey, peerId) {
     const m = this._getPeerConnVersionMap(groupKey, true);
-    const current = m.get(peerId) || 0;
-    const next = current + 1;
+    const next = (m.get(peerId) || 0) + 1;
     m.set(peerId, next);
     return next;
   }
@@ -178,106 +205,64 @@ export class PeerManager {
   }
 
   bumpAllPeerConnVersions(groupKey) {
-    const allPeers = new Set(this.listPeerIdsInGroup(groupKey));
+    const all = new Set(this.listPeerIdsInGroup(groupKey));
     const infos = this._getPeerInfosMap(groupKey, false);
-    if (infos) {
-      for (const pid of infos.keys()) {
-        allPeers.add(pid);
-      }
-    }
-    allPeers.add(MY_PEER_ID);
-    for (const pid of allPeers) {
-      this.bumpPeerConnVersion(groupKey, pid);
-    }
+    if (infos) for (const pid of infos.keys()) all.add(pid);
+    all.add(MY_PEER_ID);
+    for (const pid of all) this.bumpPeerConnVersion(groupKey, pid);
   }
 
-  setPublicServerFlag(isPublicServer) {
-    const myInfo = this.ensureMyInfo();
-    const next = !!isPublicServer;
-    const prev = !!(myInfo.featureFlag && myInfo.featureFlag.isPublicServer);
-    myInfo.featureFlag = {
-      ...myInfo.featureFlag,
-      isPublicServer: next,
-    };
-    if (next !== prev) {
-      this.bumpMyInfoVersion();
-    }
-  }
-
-  setPureP2PMode(enabled) {
-    const next = !!enabled;
-    if (next === this.pureP2PMode) return;
-    this.pureP2PMode = next;
-    const myInfo = this.ensureMyInfo();
-    myInfo.featureFlag = {
-      ...myInfo.featureFlag,
-      avoidRelayData: this.pureP2PMode,
-    };
-    this.bumpMyInfoVersion();
-  }
-
-  isPureP2PMode() {
-    return !!this.pureP2PMode;
-  }
+  // ── 内部 Map 访问器 ──
 
   _getPeersMap(groupKey, create = false) {
     const k = String(groupKey || '');
     let m = this.peersByGroup.get(k);
-    if (!m && create) {
-      m = new Map();
-      this.peersByGroup.set(k, m);
-    }
+    if (!m && create) { m = new Map(); this.peersByGroup.set(k, m); }
     return m;
   }
 
   _getPeerInfosMap(groupKey, create = false) {
     const k = String(groupKey || '');
     let m = this.peerInfosByGroup.get(k);
-    if (!m && create) {
-      m = new Map();
-      this.peerInfosByGroup.set(k, m);
-    }
+    if (!m && create) { m = new Map(); this.peerInfosByGroup.set(k, m); }
     return m;
   }
 
+  // ── Session 管理 ──
+
   _getSession(groupKey, peerId, create = false) {
     const now = Date.now();
-    if (now - this.lastSessionCleanup > Math.max(30_000, Math.min(this.sessionTtlMs / 2, 120_000))) {
-      this.cleanupSessions(now);
-    }
+    const cleanInterval = Math.max(30_000, Math.min(this.sessionTtlMs / 2, 120_000));
+    if (now - this.lastSessionCleanup > cleanInterval) this.cleanupSessions(now);
+
     const gk = String(groupKey || '');
     let g = this.routeSessions.get(gk);
-    if (!g && create) {
-      g = new Map();
-      this.routeSessions.set(gk, g);
-    }
+    if (!g && create) { g = new Map(); this.routeSessions.set(gk, g); }
     if (!g) return null;
+
     let s = g.get(peerId);
     if (!s && create) {
       s = {
-        mySessionId: null,
-        dstSessionId: null,
-        weAreInitiator: false,
-        peerInfoVerMap: new Map(),
-        connBitmapVerMap: new Map(),
-        foreignNetVer: 0,
-        lastTouch: Date.now(),
+        mySessionId:       null,
+        dstSessionId:      null,
+        weAreInitiator:    false,
+        peerInfoVerMap:    new Map(),
+        connBitmapVerMap:  new Map(),
+        foreignNetVer:     0,
+        lastTouch:         now,
         lastConnBitmapSig: null,
       };
       g.set(peerId, s);
     }
-    if (s) s.lastTouch = Date.now();
+    if (s) s.lastTouch = now;
     return s;
   }
 
   cleanupSessions(nowTs = Date.now()) {
     this.lastSessionCleanup = nowTs;
-    const ttl = this.sessionTtlMs;
     for (const [gk, m] of this.routeSessions.entries()) {
       for (const [pid, s] of m.entries()) {
-        if (nowTs - (s.lastTouch || 0) > ttl) {
-          m.delete(pid);
-        }
+        if (nowTs - (s.lastTouch || 0) > this.sessionTtlMs) m.delete(pid);
       }
       if (m.size === 0) this.routeSessions.delete(gk);
     }
@@ -286,73 +271,63 @@ export class PeerManager {
   onRouteSessionAck(groupKey, peerId, theirSessionId, weAreInitiator) {
     const s = this._getSession(groupKey, peerId, true);
     const isNewSession = s.dstSessionId !== theirSessionId;
-    
     if (isNewSession) {
-      console.log(`[SessionAck] New session detected for peer ${peerId}, resetting all version info`);
+      console.log(`[Session] New session for peer ${peerId}, resetting version info`);
       s.peerInfoVerMap.clear();
       s.connBitmapVerMap.clear();
-      s.foreignNetVer = 0;
+      s.foreignNetVer    = 0;
       s.lastConnBitmapSig = null;
-      
-      // 强制重置连接版本，确保重连后能获取完整的连接位图
-      const connVersions = this._getPeerConnVersionMap(groupKey, true);
-      connVersions.set(peerId, 1); // 重置为初始版本
+      // 重连后强制重置连接版本
+      this._getPeerConnVersionMap(groupKey, true).set(peerId, 1);
     }
-    
     s.dstSessionId = theirSessionId;
-    if (typeof weAreInitiator === 'boolean') {
-      s.weAreInitiator = weAreInitiator;
-    }
-    
-    console.log(`[SessionAck] Session updated for peer ${peerId}: newSession=${isNewSession}, weAreInitiator=${weAreInitiator}`);
+    if (typeof weAreInitiator === 'boolean') s.weAreInitiator = weAreInitiator;
+    console.log(`[Session] Updated peer ${peerId}: newSession=${isNewSession}`);
   }
+
+  // ── Peer 注册 / 注销 ──
 
   addPeer(peerId, ws) {
     const groupKey = ws && ws.groupKey ? String(ws.groupKey) : '';
-    const peers = this._getPeersMap(groupKey, true);
-    const isNewPeer = !peers.has(peerId);
+    const peers    = this._getPeersMap(groupKey, true);
+    if (!peers.has(peerId)) this.bumpAllPeerConnVersions(groupKey);
     peers.set(peerId, ws);
-    if (isNewPeer) {
-      this.bumpAllPeerConnVersions(groupKey);
-    }
   }
 
   removePeer(ws) {
-    const peerId = ws && ws.peerId;
+    const peerId   = ws && ws.peerId;
     const groupKey = ws && ws.groupKey ? String(ws.groupKey) : '';
     if (!peerId) return false;
-    
-    // 清理全局状态中的子设备信息
-    try {
-      cleanPeerAndSubPeers(groupKey, peerId);
-    } catch (e) {
-      console.warn(`[PeerCleanup] Failed to clean global state for peer ${peerId}:`, e.message);
-    }
-    
-    const peers = this._getPeersMap(groupKey, false);
-    const wasPresent = peers && peers.has(peerId);
+
+    try { cleanPeerAndSubPeers(groupKey, peerId); }
+    catch (e) { console.warn(`[PeerCleanup] Failed to clean global state for peer ${peerId}:`, e.message); }
+
+    const peers   = this._getPeersMap(groupKey, false);
+    const existed = !!(peers && peers.has(peerId));
     if (peers) peers.delete(peerId);
+
     const infos = this._getPeerInfosMap(groupKey, false);
     if (infos) infos.delete(peerId);
-    const sessions = this.routeSessions.get(groupKey);
+
+    const sessions = this.routeSessions.get(String(groupKey));
     if (sessions) {
       sessions.delete(peerId);
-      if (sessions.size === 0) this.routeSessions.delete(groupKey);
+      if (sessions.size === 0) this.routeSessions.delete(String(groupKey));
     }
+
     const connVers = this._getPeerConnVersionMap(groupKey, false);
     if (connVers) connVers.delete(peerId);
 
-    if (wasPresent && peers && peers.size > 0) {
-      this.bumpAllPeerConnVersions(groupKey);
+    if (existed && peers && peers.size > 0) this.bumpAllPeerConnVersions(groupKey);
+
+    // 组内无 peer 时清理所有相关状态
+    if (!peers || peers.size === 0) {
+      this.peersByGroup.delete(String(groupKey));
+      this.peerInfosByGroup.delete(String(groupKey));
+      this.peerConnVersions.delete(String(groupKey));
     }
 
-    if (peers && peers.size === 0) {
-      this.peersByGroup.delete(groupKey);
-      this.peerInfosByGroup.delete(groupKey);
-      this.peerConnVersions.delete(groupKey);
-    }
-    
-    console.log(`[PeerCleanup] Successfully removed peer ${peerId} from group ${groupKey}`);
+    console.log(`[PeerCleanup] Removed peer ${peerId} from group ${groupKey}`);
     return true;
   }
 
@@ -373,46 +348,47 @@ export class PeerManager {
 
   updatePeerInfo(groupKey, peerId, info) {
     const infos = this._getPeerInfosMap(groupKey, true);
-    const isNew = !infos.has(peerId);
+    if (!infos.has(peerId)) this.bumpAllPeerConnVersions(groupKey);
     infos.set(peerId, info);
-    if (isNew) {
-      this.bumpAllPeerConnVersions(groupKey);
-    }
 
+    // 自动 IP 派生（仅在开启 virtual IP 且未手动配置时）
     if (this.allowVirtualIP && !this.ipConfiguredByEnv && this.ipAutoAssigned) {
-      const myInfo = this.ensureMyInfo();
-      const peerIpv4 = info && info.ipv4Addr && typeof info.ipv4Addr.addr === 'number' ? (info.ipv4Addr.addr >>> 0) : null;
-      const peerNetLen = info && (info.networkLength || info.network_length);
-      const netLen = Number(peerNetLen || myInfo.networkLength || 24);
-      if (peerIpv4 !== null && Number.isFinite(netLen) && netLen > 0) {
-        const derived = deriveSameNetworkIpv4(peerIpv4, netLen, MY_PEER_ID);
-        if (derived !== null) {
-          let changed = false;
-          if (!this.netConfiguredByEnv) {
-            if (myInfo.networkLength !== netLen) {
-              myInfo.networkLength = netLen;
-              changed = true;
-            }
-          }
-          const prevAddr = myInfo.ipv4Addr && typeof myInfo.ipv4Addr.addr === 'number'
-            ? (myInfo.ipv4Addr.addr >>> 0)
-            : null;
-          if (prevAddr !== derived) {
-            myInfo.ipv4Addr = { addr: derived };
-            changed = true;
-          }
-
-          if (changed) {
-            this.bumpMyInfoVersion();
-            this.ipAutoAssigned = false;
-          }
-        }
-      }
+      this._tryDeriveIpFromPeer(info, groupKey);
     }
   }
 
+  _tryDeriveIpFromPeer(info, groupKey) {
+    const myInfo  = this.ensureMyInfo();
+    const peerIp  = info && info.ipv4Addr && typeof info.ipv4Addr.addr === 'number'
+      ? (info.ipv4Addr.addr >>> 0) : null;
+    const netLen  = Number(info && (info.networkLength || info.network_length) || myInfo.networkLength || 24);
+
+    if (peerIp === null || !Number.isFinite(netLen) || netLen <= 0) return;
+
+    const derived = deriveSameNetworkIpv4(peerIp, netLen, MY_PEER_ID);
+    if (derived === null) return;
+
+    let changed = false;
+    if (!this.netConfiguredByEnv && myInfo.networkLength !== netLen) {
+      myInfo.networkLength = netLen;
+      changed = true;
+    }
+    const prevAddr = myInfo.ipv4Addr && typeof myInfo.ipv4Addr.addr === 'number'
+      ? (myInfo.ipv4Addr.addr >>> 0) : null;
+    if (prevAddr !== derived) {
+      myInfo.ipv4Addr = { addr: derived };
+      changed = true;
+    }
+    if (changed) {
+      this.bumpMyInfoVersion();
+      this.ipAutoAssigned = false;
+    }
+  }
+
+  // ── 路由广播 ──
+
   broadcastRouteUpdate(types, groupKey, excludePeerId, opts = {}) {
-    const forceFull = opts.forceFull !== undefined ? !!opts.forceFull : true;
+    const forceFull = opts.forceFull !== false; // 默认 true
     if (groupKey !== undefined) {
       const peers = this._getPeersMap(groupKey, false);
       if (!peers) return;
@@ -424,7 +400,7 @@ export class PeerManager {
       }
       return;
     }
-    for (const [gk, peers] of this.peersByGroup.entries()) {
+    for (const [, peers] of this.peersByGroup.entries()) {
       for (const [peerId, ws] of peers.entries()) {
         if (peerId === excludePeerId) continue;
         if (ws.readyState === WS_OPEN) {
@@ -436,220 +412,192 @@ export class PeerManager {
 
   pushRouteUpdateTo(targetPeerId, ws, types, opts = {}) {
     const forceFull = !!opts.forceFull;
-    const groupKey = ws && ws.groupKey ? String(ws.groupKey) : '';
-    const session = this._getSession(groupKey, targetPeerId, true);
-    const myInfo = this.ensureMyInfo();
-    if (!ws.serverSessionId) {
-      ws.serverSessionId = randomU64String();
-    }
+    const groupKey  = ws && ws.groupKey ? String(ws.groupKey) : '';
+    const session   = this._getSession(groupKey, targetPeerId, true);
+    const myInfo    = this.ensureMyInfo();
+
+    if (!ws.serverSessionId) ws.serverSessionId = randomU64String();
     session.mySessionId = ws.serverSessionId;
+
     const forceFullLocal = forceFull || !session.dstSessionId;
 
-    // 收集所有相关的 peer，包括子设备
+    // 收集所有相关 peer（直连 + 路由发现 + 全局子设备）
     const allPeers = new Set(this.listPeerIdsInGroup(groupKey));
     const infos = this._getPeerInfosMap(groupKey, false);
-    if (infos) {
-      for (const pid of infos.keys()) {
-        allPeers.add(pid);
-      }
-    }
-    
-    // 添加全局 peer 映射中的子设备
+    if (infos) for (const pid of infos.keys()) allPeers.add(pid);
+
     try {
       const globalState = getPeerCenterState(groupKey);
       for (const [peerId, peerInfo] of globalState.globalPeerMap.entries()) {
         allPeers.add(Number(peerId));
         if (peerInfo.directPeers) {
-          for (const subPeerId of Object.keys(peerInfo.directPeers)) {
-            allPeers.add(Number(subPeerId));
-          }
+          for (const subId of Object.keys(peerInfo.directPeers)) allPeers.add(Number(subId));
         }
       }
     } catch (e) {
-      console.warn(`Failed to get global peer state for group ${groupKey}:`, e.message);
+      console.warn(`[RouteUpdate] Failed to get global peer state for group ${groupKey}:`, e.message);
     }
-    
-    allPeers.add(targetPeerId);
-    const relevantPeers = [MY_PEER_ID, ...Array.from(allPeers).filter(p => p !== MY_PEER_ID).sort((a, b) => Number(a) - Number(b))];
-    const defaultNetLen = myInfo.networkLength || 24;
-    
-    console.log(`[RouteUpdate] Pushing route update to ${targetPeerId} with ${relevantPeers.length} peers (including sub-peers)`);
 
+    allPeers.add(targetPeerId);
+    const relevantPeers = [
+      MY_PEER_ID,
+      ...Array.from(allPeers).filter(p => p !== MY_PEER_ID).sort((a, b) => Number(a) - Number(b)),
+    ];
+
+    // 构建 peerInfos
     const peerInfosItems = [];
     for (const pid of relevantPeers) {
-      let info = (pid === MY_PEER_ID)
+      let info = pid === MY_PEER_ID
         ? myInfo
-        : (this._getPeerInfosMap(groupKey, false)?.get(pid));
-      
-      // 只推送实际存在的 peer 信息，避免为不存在的子设备创建 stub 信息
+        : this._getPeerInfosMap(groupKey, false)?.get(pid);
+
       if (!info && pid !== MY_PEER_ID) {
-        // 检查是否是全局状态中记录的子设备
+        // 检查是否是已知子设备，避免为完全未知的 peer 生成 stub
+        let isKnownSubPeer = false;
         try {
-          const globalState = getPeerCenterState(groupKey);
-          const isKnownSubPeer = Array.from(globalState.globalPeerMap.values()).some(peerInfo => 
-            peerInfo.directPeers && String(pid) in peerInfo.directPeers
+          const gs = getPeerCenterState(groupKey);
+          isKnownSubPeer = Array.from(gs.globalPeerMap.values()).some(
+            pi => pi.directPeers && String(pid) in pi.directPeers
           );
-          
-          if (!isKnownSubPeer) {
-            console.log(`[RouteUpdate] Skipping unknown sub-peer ${pid} in route update`);
-            continue; // 跳过未知的子设备
-          }
         } catch (e) {
           console.warn(`[RouteUpdate] Failed to check global state for peer ${pid}:`, e.message);
-          continue; // 出错时跳过
         }
-        
-        // 对于已知的子设备，创建临时信息但不保存到本地映射
-        info = makeStubPeerInfo(pid, defaultNetLen);
-        console.log(`[RouteUpdate] Created temporary info for known sub-peer ${pid}`);
+        if (!isKnownSubPeer) continue;
+        info = makeStubPeerInfo(pid, myInfo.networkLength || 24);
       }
-      
-      if (!info) continue; // 确保 info 存在
-      
-      const version = info && info.version ? info.version : 1;
-      const prev = forceFullLocal ? 0 : (session.peerInfoVerMap.get(pid) || 0);
-      
-      // 强制推送或版本变化时包含该 peer 信息
+
+      if (!info) continue;
+
+      const version = info.version || 1;
+      const prev    = forceFullLocal ? 0 : (session.peerInfoVerMap.get(pid) || 0);
       if (forceFullLocal || version > prev) {
         peerInfosItems.push(info);
         session.peerInfoVerMap.set(pid, version);
-        console.log(`[RouteUpdate] Including peer ${pid} in update, forceFull=${forceFullLocal}, version=${version} > prev=${prev}`);
       }
     }
 
+    // 构建连接位图（全连接拓扑）
     let connBitmap = null;
     if (relevantPeers.length > 0) {
       const connVersions = this._getPeerConnVersionMap(groupKey, true);
-      const peerIdVersions = relevantPeers.map((pid) => {
-        const existing = connVersions.get(pid) || 1;
-        return { peerId: pid, version: existing };
-      });
-      const N = peerIdVersions.length;
+      const peerIdVersions = relevantPeers.map(pid => ({
+        peerId: pid, version: connVersions.get(pid) || 1,
+      }));
+
+      const N          = peerIdVersions.length;
       const bitmapSize = Math.ceil((N * N) / 8);
-      const bitmap = new Uint8Array(bitmapSize);
-      const idxByPeerId = new Map();
-      for (let i = 0; i < peerIdVersions.length; i++) {
-        idxByPeerId.set(peerIdVersions[i].peerId, i);
-      }
-      const setBit = (row, col) => {
-        const idx = row * N + col;
-        bitmap[Math.floor(idx / 8)] |= (1 << (idx % 8));
-      };
-      
-      // 设置所有 peer 之间的连接性（全连接拓扑）
-      // 这样所有 peer 都会尝试进行 P2P 打洞
-      for (let i = 0; i < peerIdVersions.length; i++) {
-        for (let j = 0; j < peerIdVersions.length; j++) {
-          setBit(i, j);
+      const bitmap     = new Uint8Array(bitmapSize);
+
+      // 全连接：所有 peer 对之间置位
+      for (let i = 0; i < N; i++) {
+        for (let j = 0; j < N; j++) {
+          const idx = i * N + j;
+          bitmap[Math.floor(idx / 8)] |= 1 << (idx % 8);
         }
-      }
-      
-      console.log(`[ConnBitmap] Created full-mesh connectivity for ${peerIdVersions.length} peers`);
-      
-      // --- 替换开始 ---
-      // 【核心修复】：引入基于时间戳的全局单调递增版本号，防止 Worker 重启或 P2P 交叉污染导致的版本回退
-      if (typeof this.globalNetworkVersion === 'undefined') {
-          // 初始化为当前秒数 (截断防止溢出 u32)，确保它比客户端当前所有的旧缓存版本都要大
-          this.globalNetworkVersion = Math.floor(Date.now() / 1000) % 2000000000;
       }
 
       const bitmapBuf = Buffer.from(bitmap);
-      // 签名不再包含本地错误的独立版本号，只根据拓扑结构本身计算
       const sig = `${peerIdVersions.map(p => p.peerId).join(',')}|${bitmapBuf.toString('hex')}`;
-      
-      // 只要网络拓扑发生任何变动，或者强制推送时，全局版本号 +1
+
+      // 拓扑变化或强制推送时，全局版本号 +1
       if (forceFullLocal || sig !== session.lastConnBitmapSig) {
-          this.globalNetworkVersion += 1;
-          session.lastConnBitmapSig = sig;
-          console.log(`[ConnBitmap] Topology changed, global version bumped to: ${this.globalNetworkVersion}`);
+        this.globalNetworkVersion += 1;
+        session.lastConnBitmapSig = sig;
+        console.log(`[ConnBitmap] Topology changed, global version -> ${this.globalNetworkVersion}`);
       }
 
       const currentVersion = this.globalNetworkVersion;
-      // 将所有 peer 的版本号强制刷为最新的全局版本号
-      for (let i = 0; i < peerIdVersions.length; i++) {
-          peerIdVersions[i].version = currentVersion;
-      }
+      for (const pv of peerIdVersions) pv.version = currentVersion;
 
       connBitmap = { peerIds: peerIdVersions, bitmap: bitmapBuf, version: currentVersion };
-      // --- 替换结束 ---
     }
 
-    const foreignNetworkInfos = (() => {
-      const mode = (process.env.EASYTIER_HANDSHAKE_MODE || 'foreign').toLowerCase();
-      if (mode === 'same' || mode === 'same_network') return null;
-      const version = session.foreignNetVer + 1;
-      session.foreignNetVer = version;
-      return {
-        infos: [{
-          key: {
-            peerId: MY_PEER_ID,
-            networkName: process.env.EASYTIER_PUBLIC_SERVER_NETWORK_NAME || 'dev-websocket-relay'
-          },
-          value: {
-            foreignPeerIds: Array.from(allPeers),
-            lastUpdate: { seconds: Math.floor(Date.now() / 1000), nanos: 0 },
-            version,
-            // 【关键修复 6】：必须严格传入 32 字节的全 0 Buffer，官方 proto 定义这里是 bytes network_secret_digest 
-            networkSecretDigest: Buffer.alloc(32),
-            myPeerIdForThisNetwork: MY_PEER_ID
-          }
-        }]
-      };
-    })();
+    // 外网信息（foreign network）
+    const foreignNetworkInfos = this._buildForeignNetworkInfos(session, allPeers, ws);
 
-    const t = this.types;
-    if (!t) {
-      throw new Error('PeerManager types not set');
-    }
-    const rawPeerInfos = peerInfosItems.length > 0
-      ? peerInfosItems.map(info => t.RoutePeerInfo.encode(info).finish())
-      : null;
+    // 编码并发送
+    if (!types) throw new Error('PeerManager types not set');
 
     const reqPayload = {
-      myPeerId: MY_PEER_ID,
-      mySessionId: ws.serverSessionId,
-      isInitiator: !!ws.weAreInitiator,
-      peerInfos: peerInfosItems.length > 0 ? { items: peerInfosItems } : null,
-      rawPeerInfos: rawPeerInfos,
-      connBitmap: connBitmap,
-      foreignNetworkInfos: foreignNetworkInfos
+      myPeerId:            MY_PEER_ID,
+      mySessionId:         ws.serverSessionId,
+      isInitiator:         !!ws.weAreInitiator,
+      peerInfos:           peerInfosItems.length > 0 ? { items: peerInfosItems } : null,
+      rawPeerInfos:        peerInfosItems.length > 0
+        ? peerInfosItems.map(info => types.RoutePeerInfo.encode(info).finish())
+        : null,
+      connBitmap,
+      foreignNetworkInfos,
     };
-
-    const reqBytes = t.SyncRouteInfoRequest.encode(reqPayload).finish();
-    const rpcRequestPayload = { request: reqBytes, timeoutMs: 5000 };
-    const rpcRequestBytes = t.RpcRequest.encode(rpcRequestPayload).finish();
 
     const rpcReqPacket = {
-      fromPeer: MY_PEER_ID,
-      toPeer: targetPeerId,
+      fromPeer:      MY_PEER_ID,
+      toPeer:        targetPeerId,
       transactionId: Number(BigInt.asUintN(32, BigInt(randomU64String()))),
       descriptor: {
-        domainName: ws.domainName || "public_server",
-        protoName: 'OspfRouteRpc',
+        domainName:  ws.domainName || 'public_server',
+        protoName:   'OspfRouteRpc',
         serviceName: 'OspfRouteRpc',
-        methodIndex: process.env.EASYTIER_OSPF_ROUTE_METHOD_INDEX ? Number(process.env.EASYTIER_OSPF_ROUTE_METHOD_INDEX) : 1
+        methodIndex: process.env.EASYTIER_OSPF_ROUTE_METHOD_INDEX
+          ? Number(process.env.EASYTIER_OSPF_ROUTE_METHOD_INDEX)
+          : 1,
       },
-      body: rpcRequestBytes,
-      isRequest: true,
-      totalPieces: 1,
-      pieceIdx: 0,
-      traceId: 0,
-      compressionInfo: { algo: 1, acceptedAlgo: 1 }
+      body:         types.RpcRequest.encode({
+        request:   types.SyncRouteInfoRequest.encode(reqPayload).finish(),
+        timeoutMs: 5000,
+      }).finish(),
+      isRequest:    true,
+      totalPieces:  1,
+      pieceIdx:     0,
+      traceId:      0,
+      compressionInfo: { algo: 1, acceptedAlgo: 1 },
     };
 
-    const rpcPacketBytes = t.RpcPacket.encode(rpcReqPacket).finish();
+    const env = ws._env;
+    const rpcPacketBytes = types.RpcPacket.encode(rpcReqPacket).finish();
     try {
-      ws.send(wrapPacket(createHeader, MY_PEER_ID, targetPeerId, PacketType.RpcReq, rpcPacketBytes, ws));
+      ws.send(wrapPacket(createHeader, MY_PEER_ID, targetPeerId, PacketType.RpcReq, rpcPacketBytes, ws, { env }));
     } catch (e) {
-      // ignore
+      // 发送失败（连接可能已断开），忽略；心跳机制会处理后续清理
+      console.warn(`[RouteUpdate] Failed to send to peer ${targetPeerId}: ${e.message}`);
     }
+  }
+
+  _buildForeignNetworkInfos(session, allPeers, ws) {
+    const env  = ws && ws._env;
+    const mode = ((env && env.EASYTIER_HANDSHAKE_MODE) || process.env.EASYTIER_HANDSHAKE_MODE || 'foreign').toLowerCase();
+    if (mode === 'same' || mode === 'same_network') return null;
+
+    const version = session.foreignNetVer + 1;
+    session.foreignNetVer = version;
+
+    const networkName =
+      (env && env.EASYTIER_PUBLIC_SERVER_NETWORK_NAME) ||
+      process.env.EASYTIER_PUBLIC_SERVER_NETWORK_NAME ||
+      'dev-websocket-relay';
+
+    return {
+      infos: [{
+        key: { peerId: MY_PEER_ID, networkName },
+        value: {
+          foreignPeerIds:       Array.from(allPeers),
+          lastUpdate:           { seconds: Math.floor(Date.now() / 1000), nanos: 0 },
+          version,
+          networkSecretDigest:  Buffer.alloc(32), // 32 字节全零，符合 proto 定义
+          myPeerIdForThisNetwork: MY_PEER_ID,
+        },
+      }],
+    };
   }
 }
 
+// ──────────────────────────────────────────────────────────────
+// 单例
+// ──────────────────────────────────────────────────────────────
+
 let peerManagerInstance = null;
+
 export function getPeerManager() {
-  if (!peerManagerInstance) {
-    peerManagerInstance = new PeerManager();
-  }
+  if (!peerManagerInstance) peerManagerInstance = new PeerManager();
   return peerManagerInstance;
 }

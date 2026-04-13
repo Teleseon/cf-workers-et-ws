@@ -1,456 +1,402 @@
 import { MY_PEER_ID, PacketType } from './constants.js';
 import { createHeader } from './packet.js';
 import { getPeerManager } from './peer_manager.js';
-import { wrapPacket, randomU64String, sha256 } from './crypto.js';
+import { wrapPacket, randomU64String } from './crypto.js';
 import { gzipMaybe, gunzipMaybe, isCompressionAvailable } from './compress.js';
-import { loadProtos } from './protos.js';
 import { getPeerCenterState, calcPeerCenterDigestFromMap, buildPeerCenterResponseMap } from './global_state.js';
 
-// Helper to convert transactionId to proper format for protobuf int64
+// ──────────────────────────────────────────────────────────────
+// transactionId 工具（原版在 handleRpcReq / handleRpcResp /
+// sendRpcResponse 中各写了一遍相同的 50 行；提取为一个函数）
+// ──────────────────────────────────────────────────────────────
+
+/**
+ * 将 protobufjs 可能返回的各种 int64 类型统一转为 { low, high, unsigned } 形式，
+ * 以便安全地传回 protobuf 编码。
+ */
 function toLongForProto(value) {
   if (value === null || value === undefined) return value;
 
-  // If it's already a Long-like object with low/high
-  if (value && typeof value === 'object' && typeof value.low === 'number' && typeof value.high === 'number') {
-    return value;
+  if (value && typeof value === 'object' &&
+      typeof value.low === 'number' && typeof value.high === 'number') {
+    return value; // 已是 Long-like 对象
   }
 
-  // If it's a Long instance
-  if (value && typeof value === 'object' && value.constructor && value.constructor.name === 'Long') {
-    return value;
+  if (typeof value === 'bigint') {
+    return { low: Number(value & 0xffffffffn), high: Number((value >> 32n) & 0xffffffffn), unsigned: false };
   }
 
-  // If it's a string, try to parse as BigInt first, then convert
   if (typeof value === 'string') {
     try {
       const big = BigInt(value);
-      const low = Number(big & 0xffffffffn);
-      const high = Number((big >> 32n) & 0xffffffffn);
-      return { low, high, unsigned: false };
-    } catch (e) {
-      console.warn(`Failed to parse transactionId string as BigInt: ${value}`);
+      return { low: Number(big & 0xffffffffn), high: Number((big >> 32n) & 0xffffffffn), unsigned: false };
+    } catch {
+      console.warn(`[RPC] Failed to parse transactionId string: ${value}`);
       return value;
     }
   }
 
-  // If it's a number, convert to Long
   if (typeof value === 'number') {
-    const low = value | 0;
-    const high = Math.floor(value / 4294967296);
-    return { low, high, unsigned: false };
-  }
-
-  // If it's a BigInt
-  if (typeof value === 'bigint') {
-    const low = Number(value & 0xffffffffn);
-    const high = Number((value >> 32n) & 0xffffffffn);
-    return { low, high, unsigned: false };
+    return { low: value | 0, high: Math.floor(value / 4294967296), unsigned: false };
   }
 
   return value;
 }
 
+/**
+ * 将任意 int64 格式的 transactionId 转为可读字符串（仅用于日志）
+ */
+function txIdToString(txId) {
+  if (txId === null || txId === undefined) return 'null';
+  if (typeof txId === 'bigint') return txId.toString();
+  if (typeof txId === 'string') return txId;
+  if (typeof txId === 'number') return String(txId);
+  if (txId.constructor && txId.constructor.name === 'Long') return txId.toString();
+  if (typeof txId.low === 'number' && typeof txId.high === 'number') {
+    const combined = (BigInt(txId.high) << 32n) | BigInt(txId.low >>> 0);
+    return combined.toString();
+  }
+  return String(txId);
+}
+
+// ──────────────────────────────────────────────────────────────
+// 辅助
+// ──────────────────────────────────────────────────────────────
+
 function pm() {
   return getPeerManager();
 }
 
+const COMPRESS_THRESHOLD = 256; // bytes；小包不压缩节省 CPU
+
+/**
+ * 向指定 peer 发送 RpcResp 包
+ */
 function sendRpcResponse(ws, toPeerId, reqRpcPacket, types, responseBodyBytes) {
-  if (!ws || ws.readyState !== 1) { // WS_OPEN
-    console.error(`sendRpcResponse aborted: socket not open (readyState=${ws ? ws.readyState : 'nil'}) toPeer=${toPeerId}`);
+  if (!ws || ws.readyState !== 1) {
+    console.error(`[RPC] sendRpcResponse aborted: socket not open (state=${ws ? ws.readyState : 'nil'}) toPeer=${toPeerId}`);
     return;
   }
-  const compressEnabled = process.env.EASYTIER_COMPRESS_RPC !== '0';
-  let responseBody = responseBodyBytes;
-  let compressionInfo = { algo: 1, acceptedAlgo: 1 };
-  if (compressEnabled && responseBodyBytes && responseBodyBytes.length > 256 && isCompressionAvailable()) {
+
+  // 可选压缩
+  let responseBody     = responseBodyBytes;
+  let compressionInfo  = { algo: 1, acceptedAlgo: 1 };
+  const compressEnabled = (ws._env && ws._env.EASYTIER_COMPRESS_RPC !== '0') ||
+                          (typeof process !== 'undefined' && process.env.EASYTIER_COMPRESS_RPC !== '0');
+  if (compressEnabled && responseBodyBytes && responseBodyBytes.length > COMPRESS_THRESHOLD && isCompressionAvailable()) {
     try {
-      responseBody = gzipMaybe(responseBodyBytes);
+      responseBody    = gzipMaybe(responseBodyBytes);
       compressionInfo = { algo: 2, acceptedAlgo: 1 };
     } catch (e) {
-      console.warn(`Compress rpc response failed: ${e.message}`);
+      console.warn(`[RPC] Compress response failed: ${e.message}`);
     }
   }
 
-  const rpcResponsePayload = {
+  const rpcResponseBytes = types.RpcResponse.encode({
     response: responseBody,
     error: null,
     runtimeUs: 0,
-  };
-  const rpcResponseBytes = types.RpcResponse.encode(rpcResponsePayload).finish();
+  }).finish();
 
-  // Detailed transactionId logging to debug int64 encoding issues
-  const txId = reqRpcPacket.transactionId;
-  let txIdValue, txIdType;
-  if (txId && typeof txId === 'object' && txId.constructor && txId.constructor.name === 'Long') {
-    // Long object from protobufjs
-    txIdValue = txId.toString();
-    txIdType = 'Long';
-  } else if (typeof txId === 'bigint') {
-    txIdValue = txId.toString();
-    txIdType = 'BigInt';
-  } else if (typeof txId === 'string') {
-    txIdValue = txId;
-    txIdType = 'String';
-  } else if (typeof txId === 'number') {
-    txIdValue = String(txId);
-    txIdType = 'Number';
-  } else if (txId && typeof txId === 'object' && typeof txId.low === 'number' && typeof txId.high === 'number') {
-    // Plain Long-like object
-    const combined = (BigInt(txId.high) << 32n) | BigInt(txId.low >>> 0);
-    txIdValue = combined.toString();
-    txIdType = 'Long-like';
-  } else {
-    txIdValue = String(txId);
-    txIdType = typeof txId;
-  }
-  console.log(`sendRpcResponse: transactionId=${txIdValue} (${txIdType}) raw=${JSON.stringify(txId)}`);
-
-  // Convert transactionId to proper Long format for protobuf encoding
-  const txIdForEncoding = toLongForProto(txId);
+  const txIdStr = txIdToString(reqRpcPacket.transactionId);
+  console.log(`[RPC] sendRpcResponse -> toPeer=${toPeerId} txId=${txIdStr} len=${rpcResponseBytes.length}`);
 
   const rpcRespPacket = {
-    fromPeer: MY_PEER_ID,
-    toPeer: toPeerId,
-    transactionId: txIdForEncoding,
-    descriptor: reqRpcPacket.descriptor,
-    body: rpcResponseBytes,
-    isRequest: false,
-    totalPieces: 1,
-    pieceIdx: 0,
-    traceId: reqRpcPacket.traceId,
+    fromPeer:        MY_PEER_ID,
+    toPeer:          toPeerId,
+    transactionId:   toLongForProto(reqRpcPacket.transactionId),
+    descriptor:      reqRpcPacket.descriptor,
+    body:            rpcResponseBytes,
+    isRequest:       false,
+    totalPieces:     1,
+    pieceIdx:        0,
+    traceId:         reqRpcPacket.traceId,
     compressionInfo,
   };
-  const rpcPacketBytes = types.RpcPacket.encode(rpcRespPacket).finish();
-  const buf = wrapPacket(createHeader, MY_PEER_ID, toPeerId, PacketType.RpcResp, rpcPacketBytes, ws);
+
+  const buf = wrapPacket(createHeader, MY_PEER_ID, toPeerId, PacketType.RpcResp,
+                         types.RpcPacket.encode(rpcRespPacket).finish(), ws,
+                         { env: ws._env });
   try {
     ws.send(buf);
-    console.log(`RpcResp -> to=${toPeerId} txLen=${buf.length} txTransaction=${txIdValue} SUCCESS`);
+    console.log(`[RPC] RpcResp -> toPeer=${toPeerId} txId=${txIdStr} SUCCESS`);
   } catch (e) {
-    console.error(`sendRpcResponse to ${toPeerId} failed: ${e.message}`);
-    // Re-throw to ensure caller knows the send failed
-    throw new Error(`Failed to send RPC response to ${toPeerId}: ${e.message}`);
+    console.error(`[RPC] sendRpcResponse to ${toPeerId} failed: ${e.message}`);
+    throw e; // 让调用方感知失败
   }
 }
+
+// ──────────────────────────────────────────────────────────────
+// 入口：处理 RPC 请求
+// ──────────────────────────────────────────────────────────────
 
 export function handleRpcReq(ws, header, payload, types) {
   try {
     const rpcPacket = types.RpcPacket.decode(payload);
+    console.log(`[RPC] handleRpcReq from=${header.fromPeerId} txId=${txIdToString(rpcPacket.transactionId)}`);
 
-    // Log transactionId details for debugging int64 issues
-    const txId = rpcPacket.transactionId;
-    let txIdValue, txIdType, txIdDetails;
-    if (txId && typeof txId === 'object' && txId.constructor && txId.constructor.name === 'Long') {
-      txIdValue = txId.toString();
-      txIdType = 'Long';
-      txIdDetails = `low=${txId.low}, high=${txId.high}, unsigned=${txId.unsigned}`;
-    } else if (typeof txId === 'bigint') {
-      txIdValue = txId.toString();
-      txIdType = 'BigInt';
-      txIdDetails = '';
-    } else if (typeof txId === 'string') {
-      txIdValue = txId;
-      txIdType = 'String';
-      txIdDetails = '';
-    } else if (typeof txId === 'number') {
-      txIdValue = String(txId);
-      txIdType = 'Number';
-      txIdDetails = '';
-    } else if (txId && typeof txId === 'object' && typeof txId.low === 'number' && typeof txId.high === 'number') {
-      const combined = (BigInt(txId.high) << 32n) | BigInt(txId.low >>> 0);
-      txIdValue = combined.toString();
-      txIdType = 'Long-like';
-      txIdDetails = `low=${txId.low}, high=${txId.high}`;
-    } else {
-      txIdValue = String(txId);
-      txIdType = typeof txId;
-      txIdDetails = '';
-    }
-    console.log(`handleRpcReq: from=${header.fromPeerId} transactionId=${txIdValue} (${txIdType}) ${txIdDetails} raw=${JSON.stringify(txId)}`);
-
+    // 解压
     if (rpcPacket.compressionInfo && rpcPacket.compressionInfo.algo > 1 && isCompressionAvailable()) {
       try {
         rpcPacket.body = gunzipMaybe(rpcPacket.body);
         rpcPacket.compressionInfo.algo = 1;
       } catch (e) {
-        console.error(`RpcPacket decompress failed from ${header.fromPeerId}: ${e.message}`);
+        console.error(`[RPC] Decompress failed from ${header.fromPeerId}: ${e.message}`);
         return;
       }
     }
-    const descriptor = rpcPacket.descriptor;
 
-    let innerReqBody = rpcPacket.body;
+    // 剥离 RpcRequest 外层 wrapper（部分客户端会多包一层）
+    let innerBody = rpcPacket.body;
     try {
-      const rpcReqWrapper = types.RpcRequest.decode(rpcPacket.body);
-      if (rpcReqWrapper.request && rpcReqWrapper.request.length > 0) {
-        innerReqBody = rpcReqWrapper.request;
-      }
-    } catch (e) {
-      console.log("Failed to decode RpcRequest wrapper, assuming raw body:", e.message);
+      const wrapper = types.RpcRequest.decode(rpcPacket.body);
+      if (wrapper.request && wrapper.request.length > 0) innerBody = wrapper.request;
+    } catch {
+      // 忽略，直接使用 raw body
     }
 
-    if ((descriptor.serviceName === 'peer_rpc.PeerCenterRpc' || descriptor.serviceName === 'PeerCenterRpc')
-      && (descriptor.protoName === 'peer_rpc' || !descriptor.protoName)) {
-      const groupKey = ws && ws.groupKey ? String(ws.groupKey) : '';
-      const state = getPeerCenterState(groupKey);
-      if (descriptor.methodIndex === 0) {
-        const req = types.ReportPeersRequest.decode(innerReqBody);
-        const myPeerId = req.myPeerId;
-        const peers = req.peerInfos || { directPeers: {} };
+    const desc = rpcPacket.descriptor || {};
 
-        const directPeers = {};
-        if (peers.directPeers) {
-          for (const [dstPeerId, info] of Object.entries(peers.directPeers)) {
-            directPeers[String(dstPeerId)] = { latencyMs: (info && typeof info.latencyMs === 'number') ? info.latencyMs : 0 };
-          }
-        }
-        state.globalPeerMap.set(String(myPeerId), { directPeers, lastSeen: Date.now() });
-
-        const snapshot = buildPeerCenterResponseMap(groupKey, state);
-        state.digest = calcPeerCenterDigestFromMap(snapshot);
-
-        const respBytes = types.ReportPeersResponse.encode({}).finish();
-        sendRpcResponse(ws, header.fromPeerId, rpcPacket, types, respBytes);
-        return;
-      }
-
-      if (descriptor.methodIndex === 1) {
-        const req = types.GetGlobalPeerMapRequest.decode(innerReqBody);
-        const reqDigest = req.digest !== undefined && req.digest !== null ? String(req.digest) : '0';
-        if (reqDigest === state.digest && reqDigest !== '0') {
-          const respBytes = types.GetGlobalPeerMapResponse.encode({}).finish();
-          sendRpcResponse(ws, header.fromPeerId, rpcPacket, types, respBytes);
-          return;
-        }
-
-        const snapshot = buildPeerCenterResponseMap(groupKey, state);
-        state.digest = calcPeerCenterDigestFromMap(snapshot);
-        const respBytes = types.GetGlobalPeerMapResponse.encode({
-          globalPeerMap: snapshot,
-          digest: state.digest,
-        }).finish();
-        sendRpcResponse(ws, header.fromPeerId, rpcPacket, types, respBytes);
-        return;
-      }
-
-      console.log(`Unhandled PeerCenterRpc methodIndex=${descriptor.methodIndex}`);
+    // ── PeerCenterRpc ──
+    if (_isPeerCenterRpc(desc)) {
+      _handlePeerCenterRpc(ws, header, rpcPacket, innerBody, types, desc);
       return;
     }
 
-    if ((descriptor.serviceName === 'peer_rpc.OspfRouteRpc' || descriptor.serviceName === 'OspfRouteRpc')
-      && (descriptor.protoName === 'peer_rpc' || descriptor.protoName === 'peer_rpc.OspfRouteRpc' || descriptor.protoName === 'OspfRouteRpc' || !descriptor.protoName)) {
-      const req = types.SyncRouteInfoRequest.decode(innerReqBody);
-      const desc = descriptor || {};
-      const fromPeerId = header.fromPeerId;
-      console.log(`RPC Request descriptor from ${fromPeerId}: domain=${desc.domainName}, service=${desc.serviceName}, proto=${desc.protoName}, method=${desc.methodIndex}`);
-      const peerInfosCount = req.peerInfos ? req.peerInfos.items.length : 0;
-      const hasConnBitmap = !!req.connBitmap;
-      const hasForeignNet = !!req.foreignNetworkInfos;
-      console.log(`SyncRouteInfo details: SessionID=${req.mySessionId}, Initiator=${req.isInitiator}, PeerInfosCount=${peerInfosCount}, HasConnBitmap=${hasConnBitmap}, HasForeignNet=${hasForeignNet}`);
-      if (descriptor.methodIndex === 0 || descriptor.methodIndex === 1) {
-        handleSyncRouteInfo(ws, fromPeerId, rpcPacket, req, types);
+    // ── OspfRouteRpc ──
+    if (_isOspfRouteRpc(desc)) {
+      if (desc.methodIndex === 0 || desc.methodIndex === 1) {
+        const req = types.SyncRouteInfoRequest.decode(innerBody);
+        console.log(`[RPC] SyncRouteInfo from=${header.fromPeerId} session=${req.mySessionId} initiator=${req.isInitiator}`);
+        _handleSyncRouteInfo(ws, header.fromPeerId, rpcPacket, req, types);
         return;
       }
-      console.log(`Unhandled OspfRouteRpc methodIndex=${descriptor.methodIndex}`);
+      console.log(`[RPC] Unhandled OspfRouteRpc methodIndex=${desc.methodIndex}`);
       return;
     }
 
-    console.log(`Unhandled RPC Service: ${descriptor.serviceName} (proto: ${descriptor.protoName})`);
-
+    console.log(`[RPC] Unhandled service=${desc.serviceName} proto=${desc.protoName}`);
   } catch (e) {
-    console.error('RPC Decode error:', e);
+    console.error('[RPC] handleRpcReq decode error:', e);
   }
 }
+
+// ──────────────────────────────────────────────────────────────
+// 入口：处理 RPC 响应
+// ──────────────────────────────────────────────────────────────
 
 export function handleRpcResp(ws, header, payload, types) {
   try {
-    console.log(`RpcResp <- from=${header.fromPeerId} to=${header.toPeerId} len=${payload.length} packetType=${header.packetType} forwardCounter=${header.forwardCounter}`);
     const rpcPacket = types.RpcPacket.decode(payload);
+    console.log(`[RPC] handleRpcResp from=${header.fromPeerId} txId=${txIdToString(rpcPacket.transactionId)}`);
 
-    // Detailed logging for transactionId debugging
-    const txId = rpcPacket.transactionId;
-    let txIdValue, txIdType, txIdDetails;
-    if (txId && typeof txId === 'object' && txId.constructor && txId.constructor.name === 'Long') {
-      txIdValue = txId.toString();
-      txIdType = 'Long';
-      txIdDetails = `low=${txId.low}, high=${txId.high}, unsigned=${txId.unsigned}`;
-    } else if (typeof txId === 'bigint') {
-      txIdValue = txId.toString();
-      txIdType = 'BigInt';
-      txIdDetails = '';
-    } else if (typeof txId === 'string') {
-      txIdValue = txId;
-      txIdType = 'String';
-      txIdDetails = '';
-    } else if (typeof txId === 'number') {
-      txIdValue = String(txId);
-      txIdType = 'Number';
-      txIdDetails = '';
-    } else if (txId && typeof txId === 'object' && typeof txId.low === 'number' && typeof txId.high === 'number') {
-      const combined = (BigInt(txId.high) << 32n) | BigInt(txId.low >>> 0);
-      txIdValue = combined.toString();
-      txIdType = 'Long-like';
-      txIdDetails = `low=${txId.low}, high=${txId.high}`;
-    } else {
-      txIdValue = String(txId);
-      txIdType = typeof txId;
-      txIdDetails = '';
-    }
-    console.log(`handleRpcResp: transactionId=${txIdValue} (${txIdType}) ${txIdDetails} raw=${JSON.stringify(txId)}`);
+    // 解压
     if (rpcPacket.compressionInfo && rpcPacket.compressionInfo.algo > 1 && isCompressionAvailable()) {
       try {
         rpcPacket.body = gunzipMaybe(rpcPacket.body);
         rpcPacket.compressionInfo.algo = 1;
       } catch (e) {
-        console.error(`RpcResp decompress failed from ${header.fromPeerId}: ${e.message}`);
+        console.error(`[RPC] RpcResp decompress failed from ${header.fromPeerId}: ${e.message}`);
         return;
       }
     }
 
-    const descriptor = rpcPacket.descriptor || {};
-    let rpcRespBody = rpcPacket.body;
-    // Generic RpcResponse decode first (outer wrapper)
-    let rpcResponseDecoded = null;
-    try {
-      rpcResponseDecoded = types.RpcResponse.decode(rpcRespBody);
-      rpcRespBody = rpcResponseDecoded.response || rpcRespBody;
-    } catch (e) {
-      // keep raw body for best-effort handling below
-      console.warn(`RpcResp wrapper decode failed from ${header.fromPeerId}: ${e.message}`);
-    }
-    // Handle SyncRouteInfoResponse ack (OspfRouteRpc)
-    if ((descriptor.serviceName === 'peer_rpc.OspfRouteRpc' || descriptor.serviceName === 'OspfRouteRpc')
-      && (descriptor.protoName === 'peer_rpc' || descriptor.protoName === 'peer_rpc.OspfRouteRpc' || descriptor.protoName === 'OspfRouteRpc' || !descriptor.protoName)) {
+    const desc = rpcPacket.descriptor || {};
+
+    // OspfRouteRpc 响应：更新 session ack
+    if (_isOspfRouteRpc(desc)) {
+      let respBody = rpcPacket.body;
       try {
-        const resp = types.SyncRouteInfoResponse.decode(rpcRespBody);
-        const sessionId = resp && resp.sessionId ? resp.sessionId : null;
-        if (sessionId && ws && ws.groupKey !== undefined) {
-          pm().onRouteSessionAck(ws.groupKey, header.fromPeerId, sessionId, ws.weAreInitiator);
-          console.log(`RpcResp SyncRouteInfoResponse from=${header.fromPeerId} sessionId=${sessionId} acked`);
+        const wrapper = types.RpcResponse.decode(rpcPacket.body);
+        if (wrapper.response && wrapper.response.length > 0) respBody = wrapper.response;
+      } catch (e) {
+        console.warn(`[RPC] RpcResp wrapper decode failed from ${header.fromPeerId}: ${e.message}`);
+      }
+
+      try {
+        const resp = types.SyncRouteInfoResponse.decode(respBody);
+        if (resp && resp.sessionId && ws && ws.groupKey !== undefined) {
+          pm().onRouteSessionAck(ws.groupKey, header.fromPeerId, resp.sessionId, ws.weAreInitiator);
+          console.log(`[RPC] SyncRouteInfoResponse ack from=${header.fromPeerId} sessionId=${resp.sessionId}`);
         }
       } catch (e) {
-        console.error(`Decode SyncRouteInfoResponse failed from ${header.fromPeerId}: ${e.message}`);
+        console.error(`[RPC] Decode SyncRouteInfoResponse failed from ${header.fromPeerId}: ${e.message}`);
       }
       return;
     }
 
-    // Generic RpcResponse logging
-    if (rpcResponseDecoded) {
-      if (rpcResponseDecoded.error) {
-        console.warn(`RpcResp error from ${header.fromPeerId}:`, rpcResponseDecoded.error);
+    // 通用响应日志
+    try {
+      const decoded = types.RpcResponse.decode(rpcPacket.body);
+      if (decoded.error) {
+        console.warn(`[RPC] RpcResp error from ${header.fromPeerId}:`, decoded.error);
       } else {
-        console.log(`RpcResp from=${header.fromPeerId} ok`);
+        console.log(`[RPC] RpcResp from=${header.fromPeerId} ok`);
       }
+    } catch {
+      // 忽略
     }
   } catch (e) {
-    console.error('RPC Resp Decode error:', e);
+    console.error('[RPC] handleRpcResp decode error:', e);
   }
 }
 
-function handleSyncRouteInfo(ws, fromPeerId, reqRpcPacket, syncReq, types) {
-  const groupKey = ws && ws.groupKey ? String(ws.groupKey) : '';
+// ──────────────────────────────────────────────────────────────
+// 内部：PeerCenter RPC
+// ──────────────────────────────────────────────────────────────
 
-  if (!ws.serverSessionId) {
-    ws.serverSessionId = randomU64String();
+function _handlePeerCenterRpc(ws, header, rpcPacket, innerBody, types, desc) {
+  const groupKey = ws && ws.groupKey ? String(ws.groupKey) : '';
+  const state    = getPeerCenterState(groupKey);
+
+  if (desc.methodIndex === 0) {
+    // ReportPeers
+    const req = types.ReportPeersRequest.decode(innerBody);
+    const directPeers = {};
+    if (req.peerInfos && req.peerInfos.directPeers) {
+      for (const [dstId, info] of Object.entries(req.peerInfos.directPeers)) {
+        directPeers[String(dstId)] = {
+          latencyMs: (info && typeof info.latencyMs === 'number') ? info.latencyMs : 0,
+        };
+      }
+    }
+    state.globalPeerMap.set(String(req.myPeerId), { directPeers, lastSeen: Date.now() });
+
+    const snapshot = buildPeerCenterResponseMap(groupKey, state, pm());
+    state.digest   = calcPeerCenterDigestFromMap(snapshot);
+
+    sendRpcResponse(ws, header.fromPeerId, rpcPacket, types,
+                    types.ReportPeersResponse.encode({}).finish());
+    return;
   }
 
-  if (syncReq && typeof syncReq.isInitiator === 'boolean') {
+  if (desc.methodIndex === 1) {
+    // GetGlobalPeerMap — 支持摘要短路（digest 未变则返回空响应）
+    const req       = types.GetGlobalPeerMapRequest.decode(innerBody);
+    const reqDigest = req.digest !== null && req.digest !== undefined ? String(req.digest) : '0';
+
+    if (reqDigest !== '0' && reqDigest === state.digest) {
+      sendRpcResponse(ws, header.fromPeerId, rpcPacket, types,
+                      types.GetGlobalPeerMapResponse.encode({}).finish());
+      return;
+    }
+
+    const snapshot = buildPeerCenterResponseMap(groupKey, state, pm());
+    state.digest   = calcPeerCenterDigestFromMap(snapshot);
+    sendRpcResponse(ws, header.fromPeerId, rpcPacket, types,
+                    types.GetGlobalPeerMapResponse.encode({
+                      globalPeerMap: snapshot,
+                      digest: state.digest,
+                    }).finish());
+    return;
+  }
+
+  console.log(`[RPC] Unhandled PeerCenterRpc methodIndex=${desc.methodIndex}`);
+}
+
+// ──────────────────────────────────────────────────────────────
+// 内部：SyncRouteInfo
+// ──────────────────────────────────────────────────────────────
+
+function _handleSyncRouteInfo(ws, fromPeerId, reqRpcPacket, syncReq, types) {
+  const groupKey = ws && ws.groupKey ? String(ws.groupKey) : '';
+
+  if (!ws.serverSessionId) ws.serverSessionId = randomU64String();
+
+  if (typeof syncReq.isInitiator === 'boolean') {
     ws.weAreInitiator = !syncReq.isInitiator;
   }
   pm().onRouteSessionAck(groupKey, fromPeerId, syncReq.mySessionId, ws.weAreInitiator);
 
+  // 处理 peer 信息
   let hasNewPeers = false;
   let hasSubPeers = false;
-  
-  // 处理路由信息中的 peer 信息
+
   if (syncReq.peerInfos && syncReq.peerInfos.items) {
-    console.log(`[SyncRoute] Processing ${syncReq.peerInfos.items.length} peer infos from ${fromPeerId}`);
-    
-    syncReq.peerInfos.items.forEach(info => {
-      if (info.peerId !== MY_PEER_ID) {
-        const infos = pm()._getPeerInfosMap(groupKey, false);
-        const isNew = !infos || !infos.has(info.peerId);
-        
-        // 如果客户端提供了有效的 STUN 信息，保留它
-        // 否则使用默认的 P2P 友好的 NAT 类型
-        if (!info.udpStunInfo || info.udpStunInfo === 0) {
-          info.udpStunInfo = 3; // 默认设置为 FullCone NAT，鼓励 P2P 打洞
-        }
-        
-        pm().updatePeerInfo(groupKey, info.peerId, info);
+    const items = syncReq.peerInfos.items;
+    console.log(`[SyncRoute] Processing ${items.length} peer infos from ${fromPeerId}`);
+
+    for (const info of items) {
+      // 保留客户端的 STUN 信息；若为 0 则默认 FullCone，鼓励 P2P 打洞
+      if (!info.udpStunInfo) info.udpStunInfo = 3;
+
+      pm().updatePeerInfo(groupKey, info.peerId, info);
+
+      const isServer = info.peerId === MY_PEER_ID;
+      const isDirect = pm().listPeerIdsInGroup(groupKey).includes(info.peerId);
+
+      if (!isServer) {
+        const infos  = pm()._getPeerInfosMap(groupKey, false);
+        const isNew  = !infos || !infos.has(info.peerId);
         if (isNew) hasNewPeers = true;
-        
-        // 检查是否是子设备（不是直接连接的 peer）
-        const directPeers = pm().listPeerIdsInGroup(groupKey);
-        if (!directPeers.includes(info.peerId)) {
+        if (!isDirect) {
           hasSubPeers = true;
-          console.log(`[SyncRoute] Discovered sub-peer ${info.peerId} via ${fromPeerId}, NAT type: ${info.udpStunInfo}`);
-        } else {
-          console.log(`[SyncRoute] Updated peer ${info.peerId}, NAT type: ${info.udpStunInfo}`);
+          console.log(`[SyncRoute] Discovered sub-peer ${info.peerId} via ${fromPeerId}`);
         }
       }
-      if (info.peerId === MY_PEER_ID) {
-        pm().updatePeerInfo(groupKey, info.peerId, info);
-      }
-    });
-  }
+    }
 
-  // 更新全局 peer 中心状态，记录子设备信息
-  if (hasSubPeers) {
-    const state = getPeerCenterState(groupKey);
-    const directPeers = {};
-    
-    // 记录从当前 peer 发现的子设备
-    if (syncReq.peerInfos && syncReq.peerInfos.items) {
-      syncReq.peerInfos.items.forEach(info => {
+    // 记录子设备到全局 PeerCenter 状态
+    if (hasSubPeers) {
+      const subPeerEntries = {};
+      for (const info of items) {
         if (info.peerId !== MY_PEER_ID && info.peerId !== fromPeerId) {
-          directPeers[String(info.peerId)] = { latencyMs: 10 }; // 默认延迟
+          subPeerEntries[String(info.peerId)] = { latencyMs: 10 };
         }
-      });
-    }
-    
-    if (Object.keys(directPeers).length > 0) {
-      state.globalPeerMap.set(String(fromPeerId), { 
-        directPeers, 
-        lastSeen: Date.now() 
-      });
-      console.log(`[PeerCenter] Updated global peer map for ${fromPeerId} with ${Object.keys(directPeers).length} sub-peers`);
+      }
+      if (Object.keys(subPeerEntries).length > 0) {
+        const state = getPeerCenterState(groupKey);
+        state.globalPeerMap.set(String(fromPeerId), { directPeers: subPeerEntries, lastSeen: Date.now() });
+        console.log(`[PeerCenter] Updated ${fromPeerId} with ${Object.keys(subPeerEntries).length} sub-peers`);
+      }
     }
   }
 
-  const respPayload = {
+  // 发送 SyncRouteInfoResponse
+  const respBytes = types.SyncRouteInfoResponse.encode({
     isInitiator: !syncReq.isInitiator,
-    sessionId: ws.serverSessionId
-  };
-  const respBytes = types.SyncRouteInfoResponse.encode(respPayload).finish();
-  if (reqRpcPacket.compressionInfo && reqRpcPacket.compressionInfo.algo > 1) {
-    console.warn(`Client sent COMPRESSED RPC body (Algo: ${reqRpcPacket.compressionInfo.algo}). We might have failed to decode it correctly if we didn't decompress.`);
-  }
+    sessionId:   ws.serverSessionId,
+  }).finish();
 
-  // Respond with SyncRouteInfoResponse - wrapped in try-catch to ensure response always sends
-  // This fixes the "sync_route_info failed timeout" error that prevents DO hibernation
   try {
     sendRpcResponse(ws, fromPeerId, reqRpcPacket, types, respBytes);
-    console.log(`Sent SyncRouteInfoResponse to peer ${fromPeerId}, transactionId=${reqRpcPacket.transactionId}`);
+    console.log(`[SyncRoute] SyncRouteInfoResponse sent to ${fromPeerId}`);
   } catch (e) {
-    console.error(`CRITICAL: Failed to send SyncRouteInfoResponse to peer ${fromPeerId}: ${e.message}`);
-    // Don't rethrow - we want the RPC to complete even if pushRouteUpdateTo fails
+    console.error(`[SyncRoute] CRITICAL: Failed to send SyncRouteInfoResponse to ${fromPeerId}: ${e.message}`);
+    // 不重新抛出：确保后续的路由推送仍能执行
   }
 
-  // After responding, push our current route info back to the requester (mirrors node behavior).
+  // 推送路由信息给请求方
   try {
     pm().pushRouteUpdateTo(fromPeerId, ws, types, { forceFull: true });
-    console.log(`Successfully pushed route update to peer ${fromPeerId}`);
   } catch (e) {
-    console.error(`Failed to push route update to peer ${fromPeerId}:`, e);
+    console.error(`[SyncRoute] Failed to push route update to ${fromPeerId}:`, e);
   }
 
-  // 如果有新的 peer 或子设备，广播路由更新
+  // 若拓扑变化，广播给组内其他 peer
   if (hasNewPeers || hasSubPeers) {
     try {
       pm().broadcastRouteUpdate(types, groupKey, fromPeerId, { forceFull: true });
-      console.log(`Successfully broadcast route update for group ${groupKey} (newPeers:${hasNewPeers}, subPeers:${hasSubPeers})`);
+      console.log(`[SyncRoute] Broadcast route update for group ${groupKey}`);
     } catch (e) {
-      console.error(`Failed to broadcast route update for group ${groupKey}:`, e);
+      console.error(`[SyncRoute] Broadcast failed for group ${groupKey}:`, e);
     }
   }
+}
+
+// ──────────────────────────────────────────────────────────────
+// 服务名匹配工具
+// ──────────────────────────────────────────────────────────────
+
+function _isPeerCenterRpc(desc) {
+  return (desc.serviceName === 'peer_rpc.PeerCenterRpc' || desc.serviceName === 'PeerCenterRpc') &&
+         (!desc.protoName || desc.protoName === 'peer_rpc');
+}
+
+function _isOspfRouteRpc(desc) {
+  return (desc.serviceName === 'peer_rpc.OspfRouteRpc' || desc.serviceName === 'OspfRouteRpc') &&
+         (!desc.protoName ||
+          desc.protoName === 'peer_rpc' ||
+          desc.protoName === 'peer_rpc.OspfRouteRpc' ||
+          desc.protoName === 'OspfRouteRpc');
 }
