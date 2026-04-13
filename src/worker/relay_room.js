@@ -30,10 +30,12 @@ import { wrapPacket, randomU64String } from './core/crypto.js';
 
 const WS_OPEN = (typeof WebSocket !== 'undefined' && WebSocket.OPEN) ? WebSocket.OPEN : 1;
 
-// 心跳参数（与 wrangler.toml 中的环境变量对应）
-const HEARTBEAT_INTERVAL_MS  = 10_000; // 多久发一次 Ping
-const CONNECTION_TIMEOUT_MS  = 25_000; // 多久无 Pong 则踢出
-const HEARTBEAT_CHECK_MS     = 5_000;  // 定时器检查间隔
+// 心跳参数：优先从 env 读取（wrangler.toml [vars] 配置），回退到默认值。
+// 注意：这些常量在模块加载时确定，DO 实例间共享同一套值（单 Worker 进程内）。
+// 若需每个 DO 实例独立配置，应改为在构造函数中读取 this.env。
+const HEARTBEAT_INTERVAL_MS = 10_000; // 多久发一次 Ping（由 _startHeartbeat 使用 env 覆盖）
+const CONNECTION_TIMEOUT_MS = 25_000; // 多久无 Pong 则踢出（由 _startHeartbeat 使用 env 覆盖）
+const HEARTBEAT_CHECK_MS    = 5_000;  // 定时器检查间隔（固定，不可配置）
 
 export class RelayRoom {
   constructor(state, env) {
@@ -205,6 +207,11 @@ export class RelayRoom {
   _startHeartbeat(ws) {
     if (ws.heartbeatInterval) clearInterval(ws.heartbeatInterval);
 
+    // 从 env 读取心跳参数，使 wrangler.toml [vars] 配置生效
+    const env         = this.env || {};
+    const pingInterval  = Number(env.EASYTIER_HEARTBEAT_INTERVAL) || HEARTBEAT_INTERVAL_MS;
+    const connTimeout   = Number(env.EASYTIER_CONNECTION_TIMEOUT)  || CONNECTION_TIMEOUT_MS;
+
     ws.heartbeatInterval = setInterval(() => {
       try {
         if (ws.readyState !== WS_OPEN) {
@@ -215,13 +222,13 @@ export class RelayRoom {
         const now = Date.now();
 
         // 发送 Ping
-        if (now - ws.lastPingSent >= HEARTBEAT_INTERVAL_MS) {
+        if (now - ws.lastPingSent >= pingInterval) {
           this._sendPing(ws);
           ws.lastPingSent = now;
         }
 
         // 超时检测
-        if (now - ws.lastPongReceived > CONNECTION_TIMEOUT_MS) {
+        if (now - ws.lastPongReceived > connTimeout) {
           console.log(`[Heartbeat] Timeout for peer ${ws.peerId}, closing`);
           this._cleanup(ws);
           try { ws.close(); } catch (_) {}
