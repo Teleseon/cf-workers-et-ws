@@ -6,16 +6,7 @@ compatibility_flags = ["nodejs_compat"]
 workers_dev = false
 preview_urls = false
 
-[observability]
-[observability.logs]
-enabled = true
-invocation_logs = true
-
-[observability.traces]
-enabled = true
-
 [vars]
-
 # ws目录
 WS_PATH = "ws"
 
