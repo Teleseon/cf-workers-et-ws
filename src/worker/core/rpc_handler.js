@@ -316,24 +316,30 @@ function _handleSyncRouteInfo(ws, fromPeerId, reqRpcPacket, syncReq, types) {
     const items = syncReq.peerInfos.items;
     console.log(`[SyncRoute] Processing ${items.length} peer infos from ${fromPeerId}`);
 
+    // 【修复 Bug1】：isNew 检查必须在 updatePeerInfo 写入之前完成，
+    //   否则 infos.has() 永远返回 true，hasNewPeers 永远为 false。
+    // 【修复 Bug2】：将 listPeerIdsInGroup（内含 Array.from）和 Set 构造
+    //   提到循环外，避免 O(n²) 的重复调用（原版每个 item 都调用一次）。
+    const existingInfos = pm()._getPeerInfosMap(groupKey, false);
+    const directSet     = new Set(pm().listPeerIdsInGroup(groupKey));
+
     for (const info of items) {
       // 保留客户端的 STUN 信息；若为 0 则默认 FullCone，鼓励 P2P 打洞
       if (!info.udpStunInfo) info.udpStunInfo = 3;
 
-      pm().updatePeerInfo(groupKey, info.peerId, info);
-
       const isServer = info.peerId === MY_PEER_ID;
-      const isDirect = pm().listPeerIdsInGroup(groupKey).includes(info.peerId);
 
       if (!isServer) {
-        const infos  = pm()._getPeerInfosMap(groupKey, false);
-        const isNew  = !infos || !infos.has(info.peerId);
+        // 先判断 isNew（updatePeerInfo 调用前），再写入
+        const isNew = !existingInfos || !existingInfos.has(info.peerId);
         if (isNew) hasNewPeers = true;
-        if (!isDirect) {
+        if (!directSet.has(info.peerId)) {
           hasSubPeers = true;
           console.log(`[SyncRoute] Discovered sub-peer ${info.peerId} via ${fromPeerId}`);
         }
       }
+
+      pm().updatePeerInfo(groupKey, info.peerId, info);
     }
 
     // 记录子设备到全局 PeerCenter 状态

@@ -488,12 +488,14 @@ export class PeerManager {
       const bitmapSize = Math.ceil((N * N) / 8);
       const bitmap     = new Uint8Array(bitmapSize);
 
-      // 全连接：所有 peer 对之间置位
-      for (let i = 0; i < N; i++) {
-        for (let j = 0; j < N; j++) {
-          const idx = i * N + j;
-          bitmap[Math.floor(idx / 8)] |= 1 << (idx % 8);
-        }
+      // 【性能】全连接位图：所有位均为 1，直接 fill(0xFF) 再处理尾部余位，
+      // 替代原版 O(N²) 的双重循环逐位置位，对 N>10 时有明显收益。
+      const totalBits = N * N;
+      const fullBytes = Math.floor(totalBits / 8);
+      bitmap.fill(0xFF, 0, fullBytes);
+      const remainBits = totalBits % 8;
+      if (remainBits > 0) {
+        bitmap[fullBytes] = (1 << remainBits) - 1;
       }
 
       const bitmapBuf = Buffer.from(bitmap);

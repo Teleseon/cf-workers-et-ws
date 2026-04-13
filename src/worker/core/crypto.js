@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import { HeaderFlag } from './constants.js';
+import { HeaderFlag, HEADER_SIZE } from './constants.js';
 
 // ──────────────────────────────────────────────
 // 内部工具
@@ -242,6 +242,11 @@ export function wrapPacket(createHeaderFn, fromPeerId, toPeerId, packetType, pay
     flags |= HeaderFlag.LatencyFirst;
   }
 
+  // 【性能】用 allocUnsafe + copy 替代 Buffer.concat，
+  // 避免在高频转发热路径上额外分配中间 Buffer（减少 GC 压力）。
   const headerBuf = createHeaderFn(fromPeerId, toPeerId, packetType, body.length, flags);
-  return Buffer.concat([headerBuf, body]);
+  const out = Buffer.allocUnsafe(HEADER_SIZE + body.length);
+  headerBuf.copy(out, 0);
+  body.copy(out, HEADER_SIZE);
+  return out;
 }
