@@ -1,45 +1,62 @@
 /**
- * EasyTier WebSocket 中继房间实现
- * 
- * 本文件实现了 WebSocket 连接管理、心跳检测和断线清理功能
- * 主要修复了原版存在的"幽灵节点"问题，实现了秒级断线检测和实时设备列表刷新
- * 
- * 核心改进：
- * - 心跳机制优化：10秒心跳间隔，25秒超时判定
- * - 主动清理机制：超时后立即触发全局网络清理  
- * - 防抖保护：防止重复清理导致的广播风暴
- * - 0值绕过修复：避免从未发过Pong的死连接成为永久幽灵
- * 
- * @file relay_room.js
- * @version 2.0.0
+ * EasyTier WebSocket 中继房间（Cloudflare Durable Object）
+ *
+ * 核心职责：
+ * - 接受 WebSocket 连接，通过 DO Hibernation API 管理生命周期
+ * - 心跳检测（10s 发 Ping / 25s 无 Pong 则踢出）
+ * - 消息路由：HandShake / Ping / Pong / RpcReq / RpcResp / 转发
+ * - 断线清理：防抖锁防止重复清理引发广播风暴
+ *
+ * 关于 setInterval 与 DO Hibernation：
+ * DO 休眠时 JS 执行暂停，setInterval 回调不会触发。
+ * 恢复时 constructor 被重新调用，_restoreSocket → _startHeartbeat
+ * 会重新创建定时器，所以心跳在恢复后仍然有效。
  */
 
 import { Buffer } from 'buffer';
 import { parseHeader, createHeader } from './core/packet.js';
 import { PacketType, HEADER_SIZE, MY_PEER_ID } from './core/constants.js';
 import { loadProtos } from './core/protos.js';
-import { handleHandshake, handlePing, handleForwarding, updateNetworkGroupActivity, removeNetworkGroupActivity } from './core/basic_handlers.js';
+import {
+  handleHandshake,
+  handlePing,
+  handleForwarding,
+  updateNetworkGroupActivity,
+  removeNetworkGroupActivity,
+} from './core/basic_handlers.js';
 import { handleRpcReq, handleRpcResp } from './core/rpc_handler.js';
 import { getPeerManager } from './core/peer_manager.js';
-import { randomU64String } from './core/crypto.js';
+import { wrapPacket, randomU64String } from './core/crypto.js';
 
 const WS_OPEN = (typeof WebSocket !== 'undefined' && WebSocket.OPEN) ? WebSocket.OPEN : 1;
 
+// 心跳参数（与 wrangler.toml 中的环境变量对应）
+const HEARTBEAT_INTERVAL_MS  = 10_000; // 多久发一次 Ping
+const CONNECTION_TIMEOUT_MS  = 25_000; // 多久无 Pong 则踢出
+const HEARTBEAT_CHECK_MS     = 5_000;  // 定时器检查间隔
+
 export class RelayRoom {
   constructor(state, env) {
-    this.state = state;
-    this.env = env;
-    this.types = loadProtos();
+    this.state       = state;
+    this.env         = env;
+    this.types       = loadProtos();
     this.peerManager = getPeerManager();
     this.peerManager.setTypes(this.types);
 
-    // Restore sockets after hibernation to keep metadata
-    this.state.getWebSockets().forEach((ws) => this._restoreSocket(ws));
+    // DO Hibernation 恢复后，重建所有 WebSocket 的内存状态
+    this.state.getWebSockets().forEach(ws => this._restoreSocket(ws));
   }
 
+  // ──────────────────────────────────────────────────────────────
+  // HTTP → WebSocket 升级
+  // ──────────────────────────────────────────────────────────────
+
   async fetch(request) {
-    const url = new URL(request.url);
-    const wsPath = '/' + this.env.WS_PATH || '/ws';
+    const url    = new URL(request.url);
+    // 【修复】原版运算符优先级 bug：'/' + env.WS_PATH || '/ws'
+    // 当 WS_PATH 为 undefined 时会得到 '/undefined' 而非 '/ws'
+    const wsPath = this.env.WS_PATH ? `/${this.env.WS_PATH}` : '/ws';
+
     if (url.pathname !== wsPath) {
       return new Response('Not found', { status: 404 });
     }
@@ -47,96 +64,194 @@ export class RelayRoom {
       return new Response('Expected websocket', { status: 400 });
     }
 
-    const pair = new WebSocketPair();
-    const server = pair[1];
-    const client = pair[0];
-    await this.handleSession(server);
+    const { 0: client, 1: server } = new WebSocketPair();
+    this.state.acceptWebSocket(server);
+    this._initSocket(server);
 
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  async handleSession(webSocket) {
-    this.state.acceptWebSocket(webSocket);
-    this._initSocket(webSocket);
-  }
+  // ──────────────────────────────────────────────────────────────
+  // DO WebSocket 事件回调
+  // ──────────────────────────────────────────────────────────────
 
   async webSocketMessage(ws, message) {
     try {
-      let buffer = null;
-      if (message instanceof ArrayBuffer) {
-        buffer = Buffer.from(message);
-      } else if (message instanceof Uint8Array) {
-        buffer = Buffer.from(message);
-      } else if (ArrayBuffer.isView(message) && message.buffer) {
-        buffer = Buffer.from(message.buffer);
-      } else {
-        console.warn('[ws] unsupported message type', typeof message);
+      const buffer = _toBuffer(message);
+      if (!buffer) {
+        console.warn('[ws] Unsupported message type:', typeof message);
         return;
       }
-      console.log(`[ws] recv len=${buffer.length}`);
+
       ws.lastSeen = Date.now();
+
       const header = parseHeader(buffer);
       if (!header) {
-        console.error('[ws] parseHeader failed, raw hex=', buffer.toString('hex'));
+        console.error('[ws] parseHeader failed, hex=', buffer.toString('hex').slice(0, 64));
         return;
       }
-      console.log(`[ws] header from=${header.fromPeerId} to=${header.toPeerId} type=${header.packetType} len=${header.len}`);
+
       const payload = buffer.subarray(HEADER_SIZE);
-      switch (header.packetType) {
-        case PacketType.HandShake:
-          console.log(`[ws] -> handleHandshake payload hex=${payload.toString('hex')}`);
-          handleHandshake(ws, header, payload, this.types);
-          break;
-        case PacketType.Ping:
-          handlePing(ws, header, payload);
-          break;
-        case PacketType.Pong:
-          this._handlePong(ws);
-          break;
-        case PacketType.RpcReq:
-          if (header.toPeerId !== PacketType.Invalid && header.toPeerId !== undefined && header.toPeerId !== null && header.toPeerId !== 0 && header.toPeerId !== PacketType.Invalid && header.toPeerId !== undefined && header.toPeerId !== null && header.toPeerId !== 0 && header.toPeerId !== PacketType.Invalid) {
-            // fallthrough handled below; guard keeps eslint quiet
-          }
-          if (header.toPeerId === PacketType.Invalid /* never true */) {
-            // no-op
-          }
-          if (header.toPeerId === undefined || header.toPeerId === null) {
-            handleRpcReq(ws, header, payload, this.types);
-            break;
-          }
-          if (header.toPeerId === MY_PEER_ID) {
-            handleRpcReq(ws, header, payload, this.types);
-            break;
-          }
-          handleForwarding(ws, header, buffer, this.types);
-          break;
-        case PacketType.RpcResp:
-          if (header.toPeerId === undefined || header.toPeerId === null || header.toPeerId === MY_PEER_ID) {
-            handleRpcResp(ws, header, payload, this.types);
-            break;
-          }
-          // If toPeerId is not MY_PEER_ID, forward to the target peer
-          if (header.packetType !== PacketType.Data) {
-            console.log(`[ws] -> forward RpcResp type=${header.packetType} from=${header.fromPeerId} to=${header.toPeerId} len=${payload.length}`);
-          }
-          handleForwarding(ws, header, buffer, this.types);
-          break;
-        case PacketType.Data:
-        default:
-          if (header.packetType !== PacketType.Data) {
-            console.log(`[ws] -> forward type=${header.packetType} len=${payload.length}`);
-          }
-          handleForwarding(ws, header, buffer, this.types);
-      }
+      this._routeMessage(ws, header, payload, buffer);
     } catch (e) {
-      console.error('relay_room message handling error:', e);
-      // 不立即关闭连接，只记录错误
-      // 连接稳定性比单个消息处理失败更重要
+      // 单条消息失败不关闭连接，记录后继续；心跳负责超时踢出
+      console.error('[ws] Message handling error:', e);
     }
   }
 
   async webSocketClose(ws) {
-    // 【修复】：加入防抖锁，防止风暴
+    this._cleanup(ws);
+  }
+
+  async webSocketError(ws) {
+    this._cleanup(ws);
+  }
+
+  // ──────────────────────────────────────────────────────────────
+  // 消息路由
+  // ──────────────────────────────────────────────────────────────
+
+  _routeMessage(ws, header, payload, fullBuffer) {
+    const { packetType, fromPeerId, toPeerId } = header;
+
+    switch (packetType) {
+      case PacketType.HandShake:
+        handleHandshake(ws, header, payload, this.types);
+        break;
+
+      case PacketType.Ping:
+        handlePing(ws, header, payload);
+        break;
+
+      case PacketType.Pong:
+        this._handlePong(ws);
+        break;
+
+      case PacketType.RpcReq:
+        // 【修复】原版有大量冗余的重复判断（PacketType.Invalid 重复 3 次）
+        // 和错误的 toPeerId===0 路由逻辑。清理为：
+        // - toPeerId 为 null/undefined/MY_PEER_ID → 本地处理
+        // - toPeerId === 0 (Invalid) → 丢弃（无效包）
+        // - 其他 → 转发
+        if (toPeerId == null || toPeerId === MY_PEER_ID) {
+          handleRpcReq(ws, header, payload, this.types);
+        } else if (toPeerId === PacketType.Invalid) {
+          // Invalid toPeerId，静默丢弃
+        } else {
+          handleForwarding(ws, header, fullBuffer, this.types);
+        }
+        break;
+
+      case PacketType.RpcResp:
+        if (toPeerId == null || toPeerId === MY_PEER_ID) {
+          handleRpcResp(ws, header, payload, this.types);
+        } else {
+          handleForwarding(ws, header, fullBuffer, this.types);
+        }
+        break;
+
+      case PacketType.Data:
+      default:
+        handleForwarding(ws, header, fullBuffer, this.types);
+        break;
+    }
+  }
+
+  // ──────────────────────────────────────────────────────────────
+  // Socket 初始化 / 恢复
+  // ──────────────────────────────────────────────────────────────
+
+  _initSocket(ws, meta = {}) {
+    const now = Date.now();
+    ws.peerId          = meta.peerId          || null;
+    ws.groupKey        = meta.groupKey        || null;
+    ws.domainName      = meta.domainName      || null;
+    ws.serverSessionId = meta.serverSessionId || randomU64String();
+    ws.weAreInitiator  = false;
+    ws.crypto          = { enabled: false };
+    ws.lastSeen        = now;
+    ws.lastPingSent    = 0;
+    // 【修复】初始化为当前时间而非 0，避免首次心跳检查时因"0距今已超时"
+    // 将从未 Pong 的连接立即踢出（冷启动后给客户端足够时间完成握手）
+    ws.lastPongReceived  = now;
+    ws.heartbeatInterval = null;
+    ws.isCleanedUp       = false;
+    // 挂载 env 引用，供 wrapPacket 读取 LATENCY_FIRST 等标志
+    ws._env = this.env;
+
+    ws.serializeAttachment?.({
+      peerId:          ws.peerId,
+      groupKey:        ws.groupKey,
+      domainName:      ws.domainName,
+      serverSessionId: ws.serverSessionId,
+    });
+
+    this._startHeartbeat(ws);
+  }
+
+  /** DO Hibernation 恢复后重建内存状态 */
+  _restoreSocket(ws) {
+    const meta = ws.deserializeAttachment ? (ws.deserializeAttachment() || {}) : {};
+    this._initSocket(ws, meta);
+    if (ws.peerId && ws.groupKey) {
+      this.peerManager.addPeer(ws.peerId, ws);
+    }
+  }
+
+  // ──────────────────────────────────────────────────────────────
+  // 心跳
+  // ──────────────────────────────────────────────────────────────
+
+  _startHeartbeat(ws) {
+    if (ws.heartbeatInterval) clearInterval(ws.heartbeatInterval);
+
+    ws.heartbeatInterval = setInterval(() => {
+      try {
+        if (ws.readyState !== WS_OPEN) {
+          this._cleanup(ws);
+          return;
+        }
+
+        const now = Date.now();
+
+        // 发送 Ping
+        if (now - ws.lastPingSent >= HEARTBEAT_INTERVAL_MS) {
+          this._sendPing(ws);
+          ws.lastPingSent = now;
+        }
+
+        // 超时检测
+        if (now - ws.lastPongReceived > CONNECTION_TIMEOUT_MS) {
+          console.log(`[Heartbeat] Timeout for peer ${ws.peerId}, closing`);
+          this._cleanup(ws);
+          try { ws.close(); } catch (_) {}
+        }
+      } catch (e) {
+        console.error('[Heartbeat] Error in interval:', e);
+      }
+    }, HEARTBEAT_CHECK_MS);
+  }
+
+  _sendPing(ws) {
+    try {
+      if (ws.readyState !== WS_OPEN) return;
+      const pingData = Buffer.from('ping');
+      const header   = createHeader(MY_PEER_ID, ws.peerId, PacketType.Ping, pingData.length);
+      ws.send(Buffer.concat([header, pingData]));
+    } catch (e) {
+      console.error(`[Heartbeat] Failed to send ping to peer ${ws.peerId}:`, e);
+    }
+  }
+
+  _handlePong(ws) {
+    ws.lastPongReceived = Date.now();
+  }
+
+  // ──────────────────────────────────────────────────────────────
+  // 断线清理（含防抖锁，防止重复触发广播风暴）
+  // ──────────────────────────────────────────────────────────────
+
+  _cleanup(ws) {
     if (ws.isCleanedUp) return;
     ws.isCleanedUp = true;
 
@@ -144,115 +259,32 @@ export class RelayRoom {
       clearInterval(ws.heartbeatInterval);
       ws.heartbeatInterval = null;
     }
-    
-    if (ws.peerId) {
-      const groupKey = ws.groupKey;
-      const removed = this.peerManager.removePeer(ws);
-      if (removed) {
-        try {
-          // 【修复】：强制携带 forceFull: true 广播，强推给所有存活节点
-          this.peerManager.broadcastRouteUpdate(this.types, groupKey, null, { forceFull: true });
-        } catch (_) { }
-      }
-      
-      if (groupKey && typeof removeNetworkGroupActivity === 'function') {
-        try {
-          removeNetworkGroupActivity(groupKey);
-        } catch (e) {
-          console.error('Error removing network group activity:', e);
-        }
-      }
-    }
-  }
 
-  async webSocketError(ws) {
-    await this.webSocketClose(ws);
-  }
+    if (!ws.peerId) return;
 
-  _initSocket(ws, meta = {}) {
-    ws.peerId = meta.peerId || null;
-    ws.groupKey = meta.groupKey || null;
-    ws.domainName = meta.domainName || null;
-    ws.lastSeen = Date.now();
-    ws.lastPingSent = 0;
-    // 【修复】：初始化为当前时间，避免 0 值导致的永久免死金牌
-    ws.lastPongReceived = Date.now();
-    ws.serverSessionId = meta.serverSessionId || randomU64String();
-    ws.weAreInitiator = false;
-    ws.crypto = { enabled: false };
-    ws.heartbeatInterval = null;
-    ws.serializeAttachment?.({
-      peerId: ws.peerId,
-      groupKey: ws.groupKey,
-      domainName: ws.domainName,
-      serverSessionId: ws.serverSessionId,
-    });
-    
-    // 启动心跳机制
-    this._startHeartbeat(ws);
-  }
-
-  _restoreSocket(ws) {
-    const meta = ws.deserializeAttachment ? (ws.deserializeAttachment() || {}) : {};
-    this._initSocket(ws, meta);
-    
-    if (ws.peerId && ws.groupKey) {
-      this.peerManager.addPeer(ws.peerId, ws);
-    }
-  }
-
-  _startHeartbeat(ws) {
-    if (ws.heartbeatInterval) {
-      clearInterval(ws.heartbeatInterval);
-    }
-    
-    // 缩短超时判定周期，提升列表刷新速度
-    const heartbeatInterval = 10000;
-    const connectionTimeout = 25000;
-    const checkInterval = 5000;
-    
-    console.log(`[heartbeat] Starting heartbeat for peer ${ws.peerId}`);
-    
-    ws.heartbeatInterval = setInterval(() => {
+    const groupKey = ws.groupKey;
+    const removed  = this.peerManager.removePeer(ws);
+    if (removed) {
       try {
-        if (ws.readyState === WS_OPEN) {
-          const now = Date.now();
-          if (now - ws.lastPingSent > heartbeatInterval) {
-            this._sendPing(ws);
-            ws.lastPingSent = now;
-          }
-          
-          // 【修复】：删掉原版错误的 > 0 判断，超时后主动触发全局网络清理
-          if (now - ws.lastPongReceived > connectionTimeout) {
-            console.log(`[heartbeat] Connection timeout for peer ${ws.peerId}, forcing cleanup`);
-            this.webSocketClose(ws);
-            try { ws.close(); } catch(_) {}
-            return;
-          }
-        } else {
-          this.webSocketClose(ws);
-        }
-      } catch (e) {
-        console.error('[heartbeat] Error in heartbeat interval:', e);
-      }
-    }, checkInterval);
-  }
+        this.peerManager.broadcastRouteUpdate(this.types, groupKey, null, { forceFull: true });
+      } catch (_) {}
+    }
 
-  _sendPing(ws) {
-    try {
-      if (ws.readyState === WS_OPEN) {
-        const pingData = Buffer.from('ping');
-        const header = createHeader(MY_PEER_ID, ws.peerId, PacketType.Ping, pingData.length);
-        ws.send(Buffer.concat([header, pingData]));
-        console.log(`[heartbeat] Sent ping to peer ${ws.peerId}`);
-      }
-    } catch (e) {
-      console.error(`[heartbeat] Failed to send ping to peer ${ws.peerId}:`, e);
+    if (groupKey && typeof removeNetworkGroupActivity === 'function') {
+      try { removeNetworkGroupActivity(groupKey); }
+      catch (e) { console.error('[Cleanup] removeNetworkGroupActivity error:', e); }
     }
   }
+}
 
-  _handlePong(ws) {
-    ws.lastPongReceived = Date.now();
-    console.log(`[heartbeat] Received pong from peer ${ws.peerId}`);
-  }
+// ──────────────────────────────────────────────────────────────
+// 工具函数
+// ──────────────────────────────────────────────────────────────
+
+/** 将 WebSocket message 统一转为 Buffer */
+function _toBuffer(message) {
+  if (message instanceof ArrayBuffer) return Buffer.from(message);
+  if (message instanceof Uint8Array)  return Buffer.from(message);
+  if (ArrayBuffer.isView(message) && message.buffer) return Buffer.from(message.buffer);
+  return null;
 }
